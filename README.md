@@ -36,12 +36,13 @@ app/src/main/kotlin/com/apps/dsimpletools/speak/
   accessibility/                   DictationAccessibilityService - focus tracking, bubble show/hide
   overlay/                         BubbleController (WindowManager overlay window) + BubbleView + BubblePositioner
   capture/                         CaptureController - FGS + AudioRecord, feeds PCM to the ASR session
-  asr/                             AsrEngine/AsrSession interfaces + SherpaAsrEngine (VAD -> Parakeet -> punct)
+  asr/                             AsrEngine/AsrSession interfaces + SherpaAsrEngine (VAD -> speaker gate -> Parakeet -> punct)
   format/                          TranscriptFormatter + RuleBasedFormatter + GeminiNanoFormatter + FormattingPipeline + FormatController
+  speaker/                         SpeakerVerifier (CAM++ gate) + SpeakerMath/SpeakerPolicy (pure) + SpeakerProfileStore + SpeakerVad + EnrollmentRecorder
   insert/                          TextInserter interface + AccessibilityTextInserter (ACTION_SET_TEXT)
   util/                            AccessibilityUtils (service-enabled check)
   ui/theme/                        Minimal Compose Material3 theme
-app/src/debug/                     DEBUG_TAP + DEBUG_TRANSCRIBE_WAV broadcast receivers (debug builds only)
+app/src/debug/                     DEBUG_TAP / DEBUG_TRANSCRIBE_WAV / DEBUG_*_FORMAT / DEBUG_INSERT_TEXT / DEBUG_*_SPEAKER broadcast receivers (debug builds only)
 ```
 
 Package: `com.apps.dsimpletools.speak` · single `:app` module · Kotlin +
@@ -236,6 +237,122 @@ adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_FORMAT_TEXT \
 - `FORMAT_LLM_REJECTED` — LLM output was empty or over-edited (>±40 % length);
   rule text kept (logs both strings).
 - `FORMAT_LLM_UNAVAILABLE` — Nano not supported on this device; rule text kept.
+
+## Speaker isolation (Step 3)
+
+Only the enrolled owner's speech is transcribed. Other voices (people nearby, a
+TV, cross-talk) are dropped **before** the recogniser, per VAD segment, so they
+never turn into inserted text. Everything is on-device.
+
+The gate uses a wespeaker **CAM++** speaker-embedding model
+(`wespeaker_en_voxceleb_CAM++_LM.onnx`, 512-dim, 16 kHz) via sherpa-onnx's
+`SpeakerEmbeddingExtractor`. The owner profile is the L2-normalised mean of N
+enrollment-utterance embeddings; each VAD segment's embedding is compared to it
+with cosine similarity. Despite the "en_voxceleb" training set, CAM++ voiceprints
+separate speakers regardless of the spoken language (verified below on
+Mandarin-speech samples).
+
+### Enrollment
+
+In the app's **Voice** section: *Enroll* (or *Re-enroll*) opens a guided dialog
+with 3 read-aloud sentences (~8–12 s each). Each utterance is recorded with the
+same capture config as dictation (`VOICE_RECOGNITION`, 16 kHz mono) + noise
+suppression, silence-trimmed with the Silero VAD, and requires **≥ 4 s of net
+speech** or it re-prompts. The 3 embeddings are averaged into the owner profile,
+persisted, and the **"Only my voice"** gate is switched on (it is only effective
+once enrolled; default ON after a successful enrollment). *Clear* forgets the
+profile.
+
+The raw per-utterance embeddings are persisted to
+`filesDir/speaker_profile.bin` (a small length-prefixed big-endian binary:
+magic/version/dim/count then `count × dim` float32s), and the mean is rebuilt
+from them on every start. sherpa-onnx's `SpeakerEmbeddingManager` is deliberately
+**not** used for persistence (its store is in-memory native and returns only a
+boolean) — computing cosine ourselves keeps the score loggable.
+
+### Gate semantics
+
+Per VAD segment, before decode:
+
+- **Accepted** (`SPEAKER_ACCEPT: sim=<x.xxx> dur=<s.s>s`) → decoded as usual.
+- **Rejected** (`SPEAKER_REJECT: sim=<x.xxx> dur=<s.s>s`) → dropped, not decoded.
+
+**Fail-open** cases always accept (dictation is never blocked by the gate):
+
+- Not enrolled, or the "Only my voice" toggle is off → accepted (no gate log).
+- CAM++ model file missing → gate disabled, `SPEAKER_MODEL_MISSING` logged once,
+  all segments accepted.
+- Embedding compute throws → `SPEAKER_ERROR` logged, segment accepted.
+
+### Threshold / short-segment policy
+
+Accept when `cosine ≥ threshold`. The threshold defaults to sherpa-onnx's
+documented **0.60** and is persisted-configurable. Short segments carry less
+speaker information and score more noisily, so a segment **< 1.0 s** is judged
+against a slightly **relaxed** threshold (`0.60 − 0.05 = 0.55`) — the gate errs
+toward keeping the owner's own brief utterances. Both numbers are named constants
+(`SpeakerPolicy.DEFAULT_THRESHOLD`, `SHORT_SEGMENT_SEC`, `SHORT_SEGMENT_RELAXATION`).
+
+### Noise suppression
+
+`NoiseSuppressor` (and `AcousticEchoCanceler` when available) are attached to
+**both** capture paths — live dictation and enrollment recording — whenever
+`NoiseSuppressor.isAvailable()`, and released with the recorder. Each capture
+session logs `NS_ATTACHED <true|false>` once. (Pixel 10 Pro: `NS_ATTACHED true`.)
+
+### Model provisioning
+
+Push the CAM++ model to the same external models dir as the ASR models, then
+`chmod` (same reason as the ASR models — see
+[the canonical recipe](#push-commands--canonical-recipe-mkdir--push--chmod)):
+
+```bash
+PKG=com.apps.dsimpletools.speak
+DEST=/sdcard/Android/data/$PKG/files/models
+adb push "models/wespeaker_en_voxceleb_CAM++_LM.onnx" "$DEST/wespeaker_en_voxceleb_CAM++_LM.onnx"
+adb shell chmod -R o+rX "$DEST"   # REQUIRED (adb-pushed files are otherwise not world-readable)
+```
+
+If the file is absent the gate simply stays disabled (logs `SPEAKER_MODEL_MISSING`
+once); dictation still works, ungated.
+
+### Log markers
+
+- `SPEAKER_INIT: dim=<n> model=<file>` — CAM++ extractor loaded.
+- `SPEAKER_MODEL_MISSING expected=<path>` — model absent; gate disabled (once).
+- `SPEAKER_ENROLLED utterances=<n> gate=on threshold=<t>` — enrollment succeeded.
+- `SPEAKER_CLEARED` — profile forgotten.
+- `SPEAKER_ACCEPT` / `SPEAKER_REJECT: sim=<x.xxx> dur=<s.s>s` — per-segment gate.
+- `SPEAKER_ERROR` — embedding compute failed → fail-open accept.
+- `SPEAKER_STATUS enrolled=… utterances=… threshold=… gate=… modelFilePresent=…
+  modelLoaded=… dim=…` — full state dump.
+- `NS_ATTACHED <true|false>` — noise suppressor attached for this capture session.
+
+### Debug broadcasts (debug builds only)
+
+```bash
+# Enroll the owner from WAV files (VAD-trims each; replaces any existing profile):
+adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_ENROLL_WAV \
+  -p com.apps.dsimpletools.speak --es paths "/sdcard/.../a.wav,/sdcard/.../b.wav"
+
+# Verify a WAV against the current profile (logs per-segment SPEAKER_ACCEPT/REJECT;
+# no enrollment change, no insert):
+adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_VERIFY_WAV \
+  -p com.apps.dsimpletools.speak --es path /sdcard/.../c.wav
+
+# Set the gate flag and/or threshold (both extras optional):
+adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_SET_SPEAKER \
+  -p com.apps.dsimpletools.speak --es gate on|off --ef threshold 0.55
+
+# Dump the gate state to logcat:
+adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_SPEAKER_STATUS \
+  -p com.apps.dsimpletools.speak
+```
+
+`DEBUG_TRANSCRIBE_WAV` runs the full VAD → gate → ASR pipeline, so the speaker
+gate applies there too: while enrolled with speaker A, transcribing a different
+speaker's WAV drops every segment and yields an empty `ASR_FINAL`; toggling the
+gate off restores the full transcript.
 
 ## Manual test flow
 

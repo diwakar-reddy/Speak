@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AudioEffect
 import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
@@ -60,6 +61,7 @@ class CaptureController(
         private set
 
     private var audioRecord: AudioRecord? = null
+    private var audioEffects: List<AudioEffect> = emptyList()
 
     @Volatile
     private var keepReading = false
@@ -111,6 +113,8 @@ class CaptureController(
         runCatching { audioRecord?.stop() }
         runCatching { audioRecord?.release() }
         audioRecord = null
+        AudioEffects.release(audioEffects)
+        audioEffects = emptyList()
         session = null
         runCatching { service.stopForeground(Service.STOP_FOREGROUND_REMOVE) }
         // Free the ~1 GB engine; teardown is the only caller, so this is the right place.
@@ -211,9 +215,14 @@ class CaptureController(
                 record.release()
                 return false
             }
+            // Attach NoiseSuppressor / AEC (when available) so nearby noise is cleaned up
+            // before the VAD, recogniser and speaker gate see the audio. Logs NS_ATTACHED.
+            audioEffects = AudioEffects.attach(record.audioSessionId)
             record.startRecording()
             if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
                 Log.e(TAG, "CAPTURE: AudioRecord did not enter RECORDING state")
+                AudioEffects.release(audioEffects)
+                audioEffects = emptyList()
                 record.release()
                 return false
             }
@@ -223,6 +232,8 @@ class CaptureController(
             true
         } catch (e: Exception) {
             Log.e(TAG, "CAPTURE: AudioRecord exception ${e.javaClass.simpleName}: ${e.message}")
+            AudioEffects.release(audioEffects)
+            audioEffects = emptyList()
             false
         }
     }
@@ -265,6 +276,8 @@ class CaptureController(
         readThread = null
         val record = audioRecord
         audioRecord = null
+        val effects = audioEffects
+        audioEffects = emptyList()
         val activeSession = session
         session = null
 
@@ -273,6 +286,7 @@ class CaptureController(
                 runCatching { thread?.join(500) }
                 runCatching { record?.stop() }
                 runCatching { record?.release() }
+                AudioEffects.release(effects)
                 // finish() flushes the VAD + decodes the tail on the engine's decode thread.
                 runCatching { activeSession?.finish() }.getOrDefault("").orEmpty()
             }

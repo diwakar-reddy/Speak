@@ -36,5 +36,21 @@
                 <action android:name="com.apps.dsimpletools.speak.DEBUG_INSERT_TEXT" />
             </intent-filter>
         </receiver>
+        <receiver
+            android:name="com.apps.dsimpletools.speak.debug.DebugSpeakerReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_ENROLL_WAV" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_VERIFY_WAV" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_SET_SPEAKER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_SPEAKER_STATUS" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

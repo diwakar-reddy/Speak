@@ -3,6 +3,9 @@ package com.apps.dsimpletools.speak.asr
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.apps.dsimpletools.speak.speaker.SpeakerDecision
+import com.apps.dsimpletools.speak.speaker.SpeakerReason
+import com.apps.dsimpletools.speak.speaker.SpeakerVerifier
 import com.k2fsa.sherpa.onnx.FeatureConfig
 import com.k2fsa.sherpa.onnx.OfflineModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
@@ -57,6 +60,10 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
     private var recognizer: OfflineRecognizer? = null
     private var vad: Vad? = null
     private var punctuation: OnlinePunctuation? = null
+
+    // Speaker-isolation gate (Step 3). Shared app-lifetime singleton; loaded on the decode
+    // thread during initialize(). Gates each VAD segment before decode — see decodeSegment().
+    private val speakerVerifier = SpeakerVerifier.getInstance(appContext)
 
     // Single-flight session ownership. The recogniser/VAD are stateful native objects
     // shared by every session; allowing two sessions (e.g. a live dictation and the
@@ -147,6 +154,10 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
                     Log.w(TAG, "ASR: punctuation enabled but model missing at ${punctModel.absolutePath}")
                 }
             }
+
+            // Load the speaker-isolation extractor on this same decode thread. A missing
+            // model is a graceful no-op (gate stays disabled); it never fails ASR init.
+            runCatching { speakerVerifier.ensureLoaded() }
 
             isReady = true
             val ms = SystemClock.elapsedRealtime() - startedAt
@@ -349,6 +360,19 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
         private fun decodeSegment(samples: FloatArray) {
             val rec = recognizer ?: return
             val durMs = samples.size * 1000L / SAMPLE_RATE
+            val durSec = samples.size.toFloat() / SAMPLE_RATE
+
+            // Speaker gate: decide whether this segment is the enrolled owner BEFORE decode.
+            // verify() never throws (compute failure fails open); the extra runCatching is a
+            // belt-and-braces guard so a gate exception can never kill the decode worker.
+            val decision = runCatching { speakerVerifier.verify(samples, durSec) }
+                .getOrElse {
+                    Log.e(TAG, "SPEAKER_ERROR: gate threw ${it.javaClass.simpleName}: ${it.message} -> fail-open accept")
+                    SpeakerDecision(accepted = true, similarity = 0f, reason = SpeakerReason.ERROR)
+                }
+            SpeakerVerifier.logDecision(decision, durSec)
+            if (!decision.accepted) return // rejected: drop before the recogniser ever sees it
+
             val t0 = SystemClock.elapsedRealtime()
             val stream = rec.createStream()
             // Wrap the native decode so the stream is always released even if decode
