@@ -92,4 +92,55 @@ class SpeakerMathTest {
         )!!
         assertEquals(mean[0], mean[1], 1e-5f) // equal components => 45 degrees
     }
+
+    // ---- compositeScore: used = max(cosine to mean, best per-utterance cosine) ----
+
+    @Test fun compositeUsesBestUtteranceWhenItBeatsTheMean() {
+        // Segment aligned with utterance 1; the blended mean sits 45 degrees away.
+        val utterances = listOf(floatArrayOf(1f, 0f), floatArrayOf(0f, 1f))
+        val mean = SpeakerMath.meanEmbedding(utterances)!!
+        val score = SpeakerMath.compositeScore(floatArrayOf(1f, 0f), mean, utterances)
+        assertEquals(0.7071f, score.meanSim, 1e-3f)
+        assertEquals(1f, score.bestUtteranceSim, 1e-5f)
+        assertEquals(score.bestUtteranceSim, score.used, 0f)
+    }
+
+    @Test fun compositeUsesMeanWhenItBeatsEveryUtterance() {
+        // Segment along the bisector: closer to the mean than to either utterance.
+        val utterances = listOf(floatArrayOf(1f, 0f), floatArrayOf(0f, 1f))
+        val mean = SpeakerMath.meanEmbedding(utterances)!!
+        val score = SpeakerMath.compositeScore(floatArrayOf(1f, 1f), mean, utterances)
+        assertEquals(1f, score.meanSim, 1e-5f)
+        assertEquals(0.7071f, score.bestUtteranceSim, 1e-3f)
+        assertEquals(score.meanSim, score.used, 0f)
+    }
+
+    @Test fun compositeBestUtteranceIsMaxAcrossAllUtterances() {
+        val utterances = listOf(
+            floatArrayOf(0f, 1f), // 90 degrees from segment -> 0
+            floatArrayOf(1f, 1f), // 45 degrees -> ~0.707
+            floatArrayOf(1f, 0f)  // aligned -> 1 (the max)
+        )
+        val mean = SpeakerMath.meanEmbedding(utterances)!!
+        val score = SpeakerMath.compositeScore(floatArrayOf(2f, 0f), mean, utterances)
+        assertEquals(1f, score.bestUtteranceSim, 1e-5f)
+    }
+
+    @Test fun compositeWithEmptyUtterancesFallsBackToMeanAlone() {
+        val mean = floatArrayOf(0.6f, 0.8f)
+        val score = SpeakerMath.compositeScore(floatArrayOf(1f, 0f), mean, emptyList())
+        assertEquals(0.6f, score.meanSim, 1e-5f)
+        assertEquals(score.meanSim, score.bestUtteranceSim, 0f)
+        assertEquals(score.meanSim, score.used, 0f)
+    }
+
+    @Test fun compositeWithSingleUtteranceEqualsMean() {
+        // One utterance: the mean profile IS that utterance (normalised), so the composite
+        // degenerates to the plain mean score — matches the honest "≈ mean" caveat.
+        val utterances = listOf(floatArrayOf(3f, 4f))
+        val mean = SpeakerMath.meanEmbedding(utterances)!!
+        val score = SpeakerMath.compositeScore(floatArrayOf(1f, 0f), mean, utterances)
+        assertEquals(score.meanSim, score.bestUtteranceSim, 1e-6f)
+        assertEquals(score.meanSim, score.used, 1e-6f)
+    }
 }

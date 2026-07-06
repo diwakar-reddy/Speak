@@ -246,11 +246,12 @@ never turn into inserted text. Everything is on-device.
 
 The gate uses a wespeaker **CAM++** speaker-embedding model
 (`wespeaker_en_voxceleb_CAM++_LM.onnx`, 512-dim, 16 kHz) via sherpa-onnx's
-`SpeakerEmbeddingExtractor`. The owner profile is the L2-normalised mean of N
-enrollment-utterance embeddings; each VAD segment's embedding is compared to it
-with cosine similarity. Despite the "en_voxceleb" training set, CAM++ voiceprints
-separate speakers regardless of the spoken language (verified below on
-Mandarin-speech samples).
+`SpeakerEmbeddingExtractor`. The owner profile keeps the raw per-utterance
+embeddings of up to **10** enrollment utterances plus their L2-normalised mean;
+each VAD segment is scored with a **composite** cosine similarity (see
+[Scoring](#scoring-composite)). Despite the "en_voxceleb" training set, CAM++
+voiceprints separate speakers regardless of the spoken language (verified below
+on Mandarin-speech samples).
 
 ### Enrollment
 
@@ -258,17 +259,56 @@ In the app's **Voice** section: *Enroll* (or *Re-enroll*) opens a guided dialog
 with 3 read-aloud sentences (~8–12 s each). Each utterance is recorded with the
 same capture config as dictation (`VOICE_RECOGNITION`, 16 kHz mono) + noise
 suppression, silence-trimmed with the Silero VAD, and requires **≥ 4 s of net
-speech** or it re-prompts. The 3 embeddings are averaged into the owner profile,
-persisted, and the **"Only my voice"** gate is switched on (it is only effective
-once enrolled; default ON after a successful enrollment). *Clear* forgets the
-profile.
+speech** or it re-prompts. The 3 embeddings become the owner profile, persisted,
+and the **"Only my voice"** gate is switched on (it is only effective once
+enrolled; default ON after a successful enrollment). *Clear* forgets the profile.
+
+**Add voice sample** (shown only when already enrolled) records ONE additional
+guided utterance — same flow, same ≥ 4 s net-speech retry — and **appends** it to
+the profile (never replaces), rebuilding the mean and bumping the shown utterance
+count. The prompt sentence rotates through 5 different texts so repeated adds
+don't all read the same words. The profile is capped at **10 utterances**: at the
+cap the **oldest** utterance rotates out first (the original 3 enrollment
+utterances may rotate out too — deliberate, the freshest samples reflect the
+owner's current voice best). Enrollment quality is the main accuracy lever: add
+samples **in the places you actually dictate** (desk, walking, car) so the
+profile spans your real acoustic conditions — the dialog reminds you of this.
 
 The raw per-utterance embeddings are persisted to
 `filesDir/speaker_profile.bin` (a small length-prefixed big-endian binary:
 magic/version/dim/count then `count × dim` float32s), and the mean is rebuilt
-from them on every start. sherpa-onnx's `SpeakerEmbeddingManager` is deliberately
-**not** used for persistence (its store is in-memory native and returns only a
-boolean) — computing cosine ourselves keeps the score loggable.
+from them on every start. The format (SPK1 v1) is unchanged by append-enrollment
+— the count field was always generic, so profiles written before it existed load
+identically. sherpa-onnx's `SpeakerEmbeddingManager` is deliberately **not** used
+for persistence (its store is in-memory native and returns only a boolean) —
+computing cosine ourselves keeps the score loggable.
+
+### Scoring (composite)
+
+A segment embedding `e` is scored against the profile as
+
+```
+score = max( cosine(e, mean),  max_i cosine(e, utterance_i) )
+```
+
+i.e. the better of the blended mean-profile match and the **best single
+enrollment utterance** match. The mean captures the owner's average voice; the
+per-utterance max lets a segment that closely resembles *one* enrollment
+condition (say, the car sample) pass even when the blended mean dilutes that
+condition. Both components are logged per gated segment
+(`SPEAKER_SCORE: mean=… bestUtt=… used=…`, debug level) and the
+`SPEAKER_ACCEPT`/`REJECT`/`BYPASS` `sim=` value **is** the composite (`used`).
+
+**Honest caveat:** composite max-scoring only pays off once the enrollment
+utterances span varied conditions. With 3 same-sitting utterances they all point
+nearly the same way, so `bestUtt ≈ mean` and the composite ≈ the old mean score —
+add samples in varied places to give the max something to work with. Emulator
+calibration (2-utterance profile, same-speaker test clip): owner long segment
+`mean=0.724 bestUtt=0.831 used=0.831` (composite +0.107 over the mean) vs a
+foreign speaker's long segment `mean=0.546 bestUtt=0.559 used=0.559` — still
+rejected at the 0.60 threshold. The impostor score rises only marginally because
+a stranger resembles one of your utterances about as much as he resembles their
+mean; genuine matches gain much more headroom.
 
 ### Gate semantics
 
@@ -291,9 +331,9 @@ Per VAD segment, before decode:
 
 ### Threshold + short-segment (held) policy
 
-Long segments accept when `cosine ≥ threshold`. The threshold defaults to
-sherpa-onnx's documented **0.60** (`SpeakerPolicy.DEFAULT_THRESHOLD`) and is
-persisted-configurable.
+Long segments accept when the [composite score](#scoring-composite)
+`≥ threshold`. The threshold defaults to sherpa-onnx's documented **0.60**
+(`SpeakerPolicy.DEFAULT_THRESHOLD`) and is persisted-configurable.
 
 **Short segments are never gated by similarity.** CAM++ voiceprints on sub-~2 s
 speech carry too little speaker information to classify: on real hardware the
@@ -358,9 +398,14 @@ once); dictation still works, ungated.
 - `SPEAKER_INIT: dim=<n> model=<file>` — CAM++ extractor loaded.
 - `SPEAKER_MODEL_MISSING expected=<path>` — model absent; gate disabled (once).
 - `SPEAKER_ENROLLED utterances=<n> gate=on threshold=<t>` — enrollment succeeded.
+- `SPEAKER_APPENDED added=<k> utterances=<n> cap=10 threshold=<t>` — extra
+  sample(s) appended to the profile (oldest rotated out beyond the cap).
 - `SPEAKER_CLEARED` — profile forgotten.
+- `SPEAKER_SCORE: mean=<x.xxx> bestUtt=<x.xxx> used=<x.xxx>` — (debug level) the
+  composite-score decomposition for a gated segment; `used` is what the decision
+  lines report as `sim=`.
 - `SPEAKER_ACCEPT` / `SPEAKER_REJECT: sim=<x.xxx> dur=<s.s>s` — per-segment gate
-  (long segments ≥ 2.0 s).
+  (long segments ≥ 2.0 s); `sim` is the composite `used` score.
 - `SPEAKER_BYPASS: sim=<x.xxx> dur=<s.s>s (held)` — short segment decoded but held.
 - `SPEAKER_SESSION: longAccepted=<n> longRejected=<n> shortHeld=<n> -> included|dropped`
   — session-end resolution of the held short segments.
@@ -375,6 +420,11 @@ once); dictation still works, ungated.
 # Enroll the owner from WAV files (VAD-trims each; replaces any existing profile):
 adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_ENROLL_WAV \
   -p com.apps.dsimpletools.speak --es paths "/sdcard/.../a.wav,/sdcard/.../b.wav"
+
+# APPEND extra utterances to the existing profile (no replacement; capped at 10,
+# oldest rotated out — same pipeline as the in-app "Add voice sample"):
+adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_APPEND_ENROLL_WAV \
+  -p com.apps.dsimpletools.speak --es paths "/sdcard/.../d.wav"
 
 # Verify a WAV against the current profile (logs per-segment SPEAKER_ACCEPT/REJECT;
 # no enrollment change, no insert):

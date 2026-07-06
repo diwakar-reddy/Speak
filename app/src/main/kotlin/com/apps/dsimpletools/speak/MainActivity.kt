@@ -71,8 +71,12 @@ data class StatusUiState(
 
 enum class EnrollPhase { IDLE, RECORDING, PROCESSING }
 
+/** FULL = 3-prompt initial enrollment (replaces); ADD_SAMPLE = one appended utterance. */
+enum class EnrollMode { FULL, ADD_SAMPLE }
+
 data class EnrollmentUiState(
     val active: Boolean = false,
+    val mode: EnrollMode = EnrollMode.FULL,
     val promptIndex: Int = 0,
     val phase: EnrollPhase = EnrollPhase.IDLE,
     val message: String? = null
@@ -86,6 +90,23 @@ private val ENROLL_PROMPTS = listOf(
         "and afterwards we could walk over to the park if the weather holds up.",
     "I've been thinking about the project timeline, and I really believe we can finish " +
         "the first version by the end of next week if everyone stays focused."
+)
+
+/**
+ * Rotating prompts for "Add voice sample" — different text each time (persisted rotation)
+ * so repeated adds don't all read the same sentence in the same cadence.
+ */
+private val ADD_SAMPLE_PROMPTS = listOf(
+    "Could you double-check the numbers in the quarterly report? Something about the " +
+        "revenue chart on page four doesn't quite add up to me.",
+    "I'm heading out in about ten minutes, so if you need anything from the store, " +
+        "text me a list and I'll pick it up on the way home.",
+    "The meeting ran long again today, but we finally agreed on the design, so the " +
+        "team can start building the first prototype on Monday.",
+    "Remind me to call the dentist tomorrow morning; I keep forgetting to reschedule " +
+        "that appointment from the week we were traveling.",
+    "It looks like it might rain later this afternoon, so let's move the barbecue to " +
+        "Saturday and invite the neighbors over as well."
 )
 
 class MainActivity : ComponentActivity() {
@@ -124,13 +145,20 @@ class MainActivity : ComponentActivity() {
                         },
                         onToggleGate = { enabled -> onToggleGate(enabled) },
                         onEnroll = { startEnrollment() },
+                        onAddSample = { startAddSample() },
                         onClearEnrollment = { clearEnrollment() }
                     )
                     if (enrollState.active) {
+                        val adding = enrollState.mode == EnrollMode.ADD_SAMPLE
                         EnrollmentDialog(
                             state = enrollState,
-                            promptText = ENROLL_PROMPTS.getOrElse(enrollState.promptIndex) { "" },
-                            promptCount = ENROLL_PROMPTS.size,
+                            title = if (adding) {
+                                "Add voice sample"
+                            } else {
+                                "Enroll your voice (${enrollState.promptIndex + 1} of ${ENROLL_PROMPTS.size})"
+                            },
+                            promptText = (if (adding) ADD_SAMPLE_PROMPTS else ENROLL_PROMPTS)
+                                .getOrElse(enrollState.promptIndex) { "" },
                             onRecord = { onEnrollRecord() },
                             onStop = { onEnrollStop() },
                             onCancel = { cancelEnrollment() }
@@ -156,22 +184,53 @@ class MainActivity : ComponentActivity() {
     // ---- Speaker enrollment flow ----
 
     private fun startEnrollment() {
+        if (!prepareRecordingFlow()) return
+        enrollState = EnrollmentUiState(
+            active = true, mode = EnrollMode.FULL, promptIndex = 0, phase = EnrollPhase.IDLE
+        )
+    }
+
+    /**
+     * "Add voice sample": record ONE extra guided utterance and APPEND it to the existing
+     * profile (offered only when already enrolled). The prompt sentence rotates through
+     * [ADD_SAMPLE_PROMPTS] via a persisted counter so repeated adds read different text.
+     */
+    private fun startAddSample() {
+        if (!speakerVerifier.isEnrolled) return // button is only shown when enrolled
+        if (!prepareRecordingFlow()) return
+        enrollState = EnrollmentUiState(
+            active = true,
+            mode = EnrollMode.ADD_SAMPLE,
+            promptIndex = nextAddSamplePromptIndex(),
+            phase = EnrollPhase.IDLE
+        )
+    }
+
+    /** Shared preconditions + recorder/extractor setup for both enrollment flows. */
+    private fun prepareRecordingFlow(): Boolean {
         if (!speakerVerifier.isModelFilePresent) {
             toast("Voice model not installed")
-            return
+            return false
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
             toast("Microphone permission needed")
             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            return
+            return false
         }
         enrollEmbeddings.clear()
         enrollRecorder = EnrollmentRecorder(this)
-        enrollState = EnrollmentUiState(active = true, promptIndex = 0, phase = EnrollPhase.IDLE)
         // Warm the extractor so the first "Stop" isn't stalled by a 28 MB model load.
         lifecycleScope.launch { withContext(Dispatchers.Default) { speakerVerifier.ensureLoaded() } }
+        return true
+    }
+
+    private fun nextAddSamplePromptIndex(): Int {
+        val prefs = getSharedPreferences(ENROLL_UI_PREFS, MODE_PRIVATE)
+        val n = prefs.getInt(KEY_ADD_PROMPT_ROTATION, 0)
+        prefs.edit().putInt(KEY_ADD_PROMPT_ROTATION, n + 1).apply()
+        return n % ADD_SAMPLE_PROMPTS.size
     }
 
     private fun onEnrollRecord() {
@@ -206,6 +265,10 @@ class MainActivity : ComponentActivity() {
                 )
                 return@launch
             }
+            if (enrollState.mode == EnrollMode.ADD_SAMPLE) {
+                finishAddSample(embedding)
+                return@launch
+            }
             enrollEmbeddings.add(embedding)
             val next = enrollState.promptIndex + 1
             if (next >= ENROLL_PROMPTS.size) {
@@ -214,6 +277,19 @@ class MainActivity : ComponentActivity() {
                 enrollState = enrollState.copy(promptIndex = next, phase = EnrollPhase.IDLE, message = null)
             }
         }
+    }
+
+    private fun finishAddSample(embedding: FloatArray) {
+        // Append (never replace): cheap file IO + in-memory maths, same as finishEnrollment.
+        val ok = speakerVerifier.appendFromEmbeddings(listOf(embedding))
+        enrollRecorder?.cancel()
+        enrollRecorder = null
+        enrollState = EnrollmentUiState(active = false)
+        toast(
+            if (ok) "Voice sample added (${speakerVerifier.utteranceCount} total)"
+            else "Couldn't add the sample, please try again"
+        )
+        refreshState()
     }
 
     private fun finishEnrollment() {
@@ -294,6 +370,9 @@ class MainActivity : ComponentActivity() {
     companion object {
         /** Minimum net (VAD-trimmed) speech required per enrollment utterance. */
         private const val MIN_ENROLL_SPEECH_SEC = 4.0f
+
+        private const val ENROLL_UI_PREFS = "speak_enroll_ui"
+        private const val KEY_ADD_PROMPT_ROTATION = "add_prompt_rotation"
     }
 }
 
@@ -306,6 +385,7 @@ private fun MainScreen(
     onSelectFormatLevel: (FormatLevel) -> Unit,
     onToggleGate: (Boolean) -> Unit,
     onEnroll: () -> Unit,
+    onAddSample: () -> Unit,
     onClearEnrollment: () -> Unit
 ) {
     Column(
@@ -341,6 +421,7 @@ private fun MainScreen(
             state = state,
             onToggleGate = onToggleGate,
             onEnroll = onEnroll,
+            onAddSample = onAddSample,
             onClearEnrollment = onClearEnrollment
         )
 
@@ -383,6 +464,7 @@ private fun VoiceSection(
     state: StatusUiState,
     onToggleGate: (Boolean) -> Unit,
     onEnroll: () -> Unit,
+    onAddSample: () -> Unit,
     onClearEnrollment: () -> Unit
 ) {
     Text(text = "Voice", style = MaterialTheme.typography.titleMedium)
@@ -438,25 +520,46 @@ private fun VoiceSection(
             Text("Clear")
         }
     }
+    if (state.speakerEnrolled) {
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onAddSample,
+            enabled = state.speakerModelPresent,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Add voice sample")
+        }
+        Text(
+            text = "Extra samples from different places improve accuracy " +
+                "(keeps the last 10; oldest are replaced).",
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
 }
 
 @Composable
 private fun EnrollmentDialog(
     state: EnrollmentUiState,
+    title: String,
     promptText: String,
-    promptCount: Int,
     onRecord: () -> Unit,
     onStop: () -> Unit,
     onCancel: () -> Unit
 ) {
     AlertDialog(
         onDismissRequest = { if (state.phase != EnrollPhase.PROCESSING) onCancel() },
-        title = { Text("Enroll your voice (${state.promptIndex + 1} of $promptCount)") },
+        title = { Text(title) },
         text = {
             Column {
                 Text("Read this aloud naturally, then tap Stop:")
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(text = promptText, fontStyle = FontStyle.Italic)
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "Tip: samples work best recorded where you actually dictate — " +
+                        "at your desk, walking, in the car.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 Spacer(modifier = Modifier.height(12.dp))
                 val status = when (state.phase) {
                     EnrollPhase.IDLE -> state.message ?: "Tap Start recording when you're ready."

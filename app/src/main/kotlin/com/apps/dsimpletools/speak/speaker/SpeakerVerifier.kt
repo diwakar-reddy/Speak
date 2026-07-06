@@ -24,9 +24,12 @@ import java.io.File
  *
  * The owner profile is the L2-normalised mean of N per-utterance embeddings. The raw
  * per-utterance embeddings are persisted (see [SpeakerProfileStore]); the mean is rebuilt
- * from them on construction. We compute cosine similarity ourselves (in [SpeakerMath]) so
- * the score is loggable — sherpa-onnx's own [com.k2fsa.sherpa.onnx.SpeakerEmbeddingManager]
- * only returns a boolean and keeps its store in native memory, so it is not used here.
+ * from them on construction. Scoring is COMPOSITE (see [SpeakerMath.compositeScore]): a
+ * segment scores `max(cosine(seg, mean), max_i cosine(seg, utterance_i))`, so a segment that
+ * closely matches one enrollment condition still passes even when the blended mean dilutes
+ * it. We compute cosine similarity ourselves (in [SpeakerMath]) so the score is loggable —
+ * sherpa-onnx's own [com.k2fsa.sherpa.onnx.SpeakerEmbeddingManager] only returns a boolean
+ * and keeps its store in native memory, so it is not used here.
  */
 class SpeakerVerifier private constructor(context: Context) {
 
@@ -150,6 +153,10 @@ class SpeakerVerifier private constructor(context: Context) {
      * Gate one VAD segment. Never throws — a compute failure fails open (accepts). The
      * ungated cases (not enrolled / gate off / model missing) accept without computing an
      * embedding, so there is zero cost when the gate is inactive.
+     *
+     * The similarity fed to [SpeakerPolicy] is the COMPOSITE score — max of the mean-profile
+     * cosine and the best per-utterance cosine — logged per segment as `SPEAKER_SCORE:` so
+     * the SPEAKER_ACCEPT/REJECT/BYPASS `sim=` value (= the composite) can be decomposed.
      */
     fun verify(segment: FloatArray, durationSec: Float): SpeakerDecision {
         val enrolled = isEnrolled
@@ -160,7 +167,16 @@ class SpeakerVerifier private constructor(context: Context) {
             return SpeakerPolicy.decide(enrolled && mean != null, gate, present, null, durationSec, threshold)
         }
         val emb = computeEmbedding(segment)
-        val sim = emb?.let { SpeakerMath.cosine(it, mean) }
+        val sim = emb?.let {
+            val score = SpeakerMath.compositeScore(it, mean, rawEmbeddings)
+            Log.d(
+                TAG,
+                "SPEAKER_SCORE: mean=${"%.3f".format(score.meanSim)} " +
+                    "bestUtt=${"%.3f".format(score.bestUtteranceSim)} " +
+                    "used=${"%.3f".format(score.used)}"
+            )
+            score.used
+        }
         return SpeakerPolicy.decide(enrolled, gate, present, sim, durationSec, threshold)
     }
 
@@ -206,6 +222,38 @@ class SpeakerVerifier private constructor(context: Context) {
         return enrollFromEmbeddings(embeddings)
     }
 
+    /**
+     * APPEND additional utterances to the existing profile (no replacement): persists them
+     * alongside the current ones and rebuilds the mean. The total is capped at
+     * [SpeakerProfileStore.MAX_UTTERANCES]; beyond it the OLDEST utterances rotate out first
+     * (the original enrollment utterances may rotate out too — by design, the freshest
+     * samples reflect the owner's current voice/conditions best). Appending from a
+     * not-enrolled state enrolls (and turns the gate on, like [enrollFromEmbeddings]).
+     */
+    @Synchronized
+    fun appendFromEmbeddings(embeddings: List<FloatArray>): Boolean {
+        if (embeddings.isEmpty()) {
+            Log.w(TAG, "SPEAKER_APPEND_FAILED no embeddings")
+            return false
+        }
+        val wasEnrolled = isEnrolled
+        val combined = runCatching { store.append(embeddings) }.getOrNull()
+        val mean = combined?.let { SpeakerMath.meanEmbedding(it) }
+        if (combined == null || mean == null) {
+            Log.w(TAG, "SPEAKER_APPEND_FAILED could not append/rebuild profile")
+            return false
+        }
+        rawEmbeddings = combined
+        profileMean = mean
+        if (!wasEnrolled) gateEnabled = true // first enrollment via append: same default as enroll
+        Log.i(
+            TAG,
+            "SPEAKER_APPENDED added=${embeddings.size} utterances=${combined.size} " +
+                "cap=${SpeakerProfileStore.MAX_UTTERANCES} threshold=$threshold"
+        )
+        return true
+    }
+
     /** Forget the owner profile. Leaves the gate flag as-is (it is inert while not enrolled). */
     @Synchronized
     fun clear() {
@@ -223,30 +271,45 @@ class SpeakerVerifier private constructor(context: Context) {
      * Runs on the caller's thread — invoke off the main thread.
      */
     fun enrollFromWavs(paths: List<String>): Boolean {
+        val embeddings = embeddingsFromWavs(paths, "DEBUG_ENROLL_WAV") ?: return false
+        return enrollFromEmbeddings(embeddings)
+    }
+
+    /**
+     * APPEND WAV utterances to the existing profile (debug) — same pipeline as
+     * [enrollFromWavs] but appending (with the [SpeakerProfileStore.MAX_UTTERANCES] cap /
+     * oldest-out rotation) instead of replacing. Runs on the caller's thread.
+     */
+    fun appendFromWavs(paths: List<String>): Boolean {
+        val embeddings = embeddingsFromWavs(paths, "DEBUG_APPEND_ENROLL_WAV") ?: return false
+        return appendFromEmbeddings(embeddings)
+    }
+
+    /** Shared WAV -> VAD-trim -> embedding pipeline for the debug enroll/append hooks. */
+    private fun embeddingsFromWavs(paths: List<String>, logPrefix: String): List<FloatArray>? {
         ensureLoaded()
         if (!modelPresent) {
-            Log.w(TAG, "DEBUG_ENROLL_WAV: model not present, aborting")
-            return false
+            Log.w(TAG, "$logPrefix: model not present, aborting")
+            return null
         }
         val vad = SpeakerVad.create(vadModelFile.absolutePath)
         if (vad == null) {
-            Log.w(TAG, "DEBUG_ENROLL_WAV: VAD unavailable at ${vadModelFile.absolutePath}")
-            return false
+            Log.w(TAG, "$logPrefix: VAD unavailable at ${vadModelFile.absolutePath}")
+            return null
         }
         try {
-            val embeddings = paths.mapNotNull { path ->
+            return paths.mapNotNull { path ->
                 val wave = runCatching { WaveReader.readWave(filename = path) }.getOrNull()
                 if (wave == null) {
-                    Log.w(TAG, "DEBUG_ENROLL_WAV: could not read $path")
+                    Log.w(TAG, "$logPrefix: could not read $path")
                     return@mapNotNull null
                 }
                 val trimmed = vad.trim(wave.samples)
                 val netSec = trimmed.size / SAMPLE_RATE.toFloat()
-                Log.i(TAG, "DEBUG_ENROLL_WAV: $path netSpeech=${"%.2f".format(netSec)}s")
+                Log.i(TAG, "$logPrefix: $path netSpeech=${"%.2f".format(netSec)}s")
                 if (trimmed.isEmpty()) return@mapNotNull null
                 computeEmbedding(trimmed)
             }
-            return enrollFromEmbeddings(embeddings)
         } finally {
             vad.release()
         }

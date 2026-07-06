@@ -59,6 +59,28 @@ class SpeakerProfileStore(private val dir: File) {
         }
     }
 
+    /**
+     * Append [newEmbeddings] to the persisted profile (no replacement), capping the total at
+     * [maxCount] utterances by dropping the OLDEST first — FIFO rotation, so once the cap is
+     * reached the earliest samples (including the original enrollment utterances) rotate out
+     * in favour of the freshest ones. Persists and returns the resulting list.
+     *
+     * The SPK1 format is unchanged (its count field was always generic), so profiles written
+     * before append-enrollment existed load identically.
+     *
+     * @throws IllegalArgumentException if a new embedding's dimension mismatches the persisted
+     *         ones (propagated from [save]; callers treat it as an append failure).
+     */
+    fun append(
+        newEmbeddings: List<FloatArray>,
+        maxCount: Int = MAX_UTTERANCES
+    ): List<FloatArray> {
+        val combined = load() + newEmbeddings
+        val capped = if (combined.size > maxCount) combined.takeLast(maxCount) else combined
+        save(capped)
+        return capped
+    }
+
     /** Load the raw per-utterance embeddings. Returns an empty list if absent/corrupt. */
     fun load(): List<FloatArray> {
         val f = file
@@ -90,6 +112,14 @@ class SpeakerProfileStore(private val dir: File) {
 
     companion object {
         const val FILE_NAME = "speaker_profile.bin"
+
+        /**
+         * Maximum utterances kept in the profile. Appends beyond this rotate the OLDEST
+         * utterance out (see [append]). 10 varied samples are plenty for a stable composite
+         * score while keeping the per-segment best-utterance scan trivially cheap.
+         */
+        const val MAX_UTTERANCES = 10
+
         private const val MAGIC = 0x53504B31 // "SPK1"
         private const val VERSION = 1
         private const val MAX_DIM = 8192
