@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-build-only additions. Merged only into debug builds so the DEBUG_TAP
+  test hook never ships in a release build.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name="com.apps.dsimpletools.speak.debug.DebugTapReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_TAP" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name="com.apps.dsimpletools.speak.debug.DebugTranscribeWavReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_TRANSCRIBE_WAV" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name="com.apps.dsimpletools.speak.debug.DebugFormatReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_SET_FORMAT_LEVEL" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_FORMAT_TEXT" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

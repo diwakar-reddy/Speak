@@ -1,0 +1,8 @@
+<resources>
+    <!--
+      Plain platform theme (not Material Components) since all real UI is
+      Jetpack Compose — this XML theme only supplies the window background
+      before Compose takes over, so we avoid pulling in an extra library.
+    -->
+    <style name="Theme.Speak" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

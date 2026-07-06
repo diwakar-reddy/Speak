@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Speak</string>
+    <string name="accessibility_service_description">Shows a floating mic bubble over text fields so you can dictate text anywhere on the device.</string>
+</resources>

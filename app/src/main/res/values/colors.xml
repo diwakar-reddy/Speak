@@ -1,0 +1,6 @@
+<resources>
+    <color name="bubble_idle">#2962FF</color>
+    <color name="bubble_listening">#E53935</color>
+    <color name="bubble_processing">#FB8C00</color>
+    <color name="ic_launcher_background">#2962FF</color>
+</resources>

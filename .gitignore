@@ -1,0 +1,31 @@
+# Gradle
+.gradle/
+build/
+
+# Local configuration (machine-specific SDK path)
+local.properties
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Kotlin
+.kotlin/
+
+# Logs
+*.log
+
+# Keystores - never commit real signing keys
+*.jks
+*.keystore
+
+# Large model/vendor assets are managed by a separate job - never touch or commit
+/vendor/
+/models/
+
+# Agent session checkpoint notes - not part of the shipped app
+/PROGRESS.md
