@@ -3,6 +3,7 @@ package com.apps.dsimpletools.speak.asr
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.apps.dsimpletools.speak.speaker.SessionGatePolicy
 import com.apps.dsimpletools.speak.speaker.SpeakerDecision
 import com.apps.dsimpletools.speak.speaker.SpeakerReason
 import com.apps.dsimpletools.speak.speaker.SpeakerVerifier
@@ -254,7 +255,16 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
         val acquired: Boolean = sessionOwner.compareAndSet(null, this)
 
         private val audioChannel = Channel<FloatArray>(capacity = Channel.UNLIMITED)
-        private val transcript = StringBuilder()
+
+        // Decoded VAD segments, in decode (= original) order. `held` short segments are withheld
+        // from the transcript until finish(), where SessionGatePolicy decides their fate; non-held
+        // segments (accepted-long / ungated / fail-open) are visible immediately.
+        private val decoded = ArrayList<Decoded>()
+
+        // Speaker session tally (only meaningful when the gate is active). Long = a segment the
+        // embedding gate could judge (>= MIN_GATED_SEGMENT_SEC); short = a bypass-held segment.
+        private var longAccepted = 0
+        private var longRejected = 0
 
         @Volatile
         override var finalizedText: String = ""
@@ -265,6 +275,10 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
         private var segmentIndex = 0
         private var totalAudioSamples = 0L
         private var totalDecodeMs = 0L
+
+        /** Transcript visible mid-session: only non-held segments, in order. */
+        private fun immediateText(): String =
+            decoded.asSequence().filterNot { it.held }.joinToString(" ") { it.text }
 
         private val worker: Job? = if (acquired) engineScope.launch { runWorker() } else null
 
@@ -362,16 +376,27 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
             val durMs = samples.size * 1000L / SAMPLE_RATE
             val durSec = samples.size.toFloat() / SAMPLE_RATE
 
-            // Speaker gate: decide whether this segment is the enrolled owner BEFORE decode.
-            // verify() never throws (compute failure fails open); the extra runCatching is a
-            // belt-and-braces guard so a gate exception can never kill the decode worker.
+            // Speaker gate: decide whether/how this segment is gated BEFORE decode. Long segments
+            // (>= MIN_GATED_SEGMENT_SEC) are gated by similarity (ACCEPT/REJECT); short segments
+            // are decoded but HELD (BYPASS) since CAM++ can't judge them; ungated/fail-open decode
+            // and append normally. verify() never throws (compute failure fails open); the extra
+            // runCatching is a belt-and-braces guard so a gate exception can never kill the worker.
             val decision = runCatching { speakerVerifier.verify(samples, durSec) }
                 .getOrElse {
                     Log.e(TAG, "SPEAKER_ERROR: gate threw ${it.javaClass.simpleName}: ${it.message} -> fail-open accept")
-                    SpeakerDecision(accepted = true, similarity = 0f, reason = SpeakerReason.ERROR)
+                    SpeakerDecision(accepted = true, held = false, similarity = 0f, reason = SpeakerReason.ERROR)
                 }
             SpeakerVerifier.logDecision(decision, durSec)
-            if (!decision.accepted) return // rejected: drop before the recogniser ever sees it
+            when (decision.reason) {
+                SpeakerReason.REJECT -> {
+                    // Rejected long segment: drop before the recogniser ever sees it.
+                    longRejected++
+                    return
+                }
+                SpeakerReason.ACCEPT -> longAccepted++
+                else -> Unit // BYPASS (held) / UNGATED / ERROR: decode below
+            }
+            if (!decision.accepted) return // defensive: any non-accepted reason is not decoded
 
             val t0 = SystemClock.elapsedRealtime()
             val stream = rec.createStream()
@@ -391,10 +416,11 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
             totalDecodeMs += SystemClock.elapsedRealtime() - t0
             if (text.isEmpty()) return
             segmentIndex++
-            if (transcript.isNotEmpty()) transcript.append(' ')
-            transcript.append(text)
-            finalizedText = transcript.toString()
-            Log.i(TAG, "ASR_SEGMENT: $segmentIndex ${durMs}ms -> \"$text\"")
+            val held = decision.held
+            decoded.add(Decoded(order = segmentIndex, text = text, held = held))
+            // Held (short-bypass) text is withheld from finalizedText until finish() resolves it.
+            if (!held) finalizedText = immediateText()
+            Log.i(TAG, "ASR_SEGMENT: $segmentIndex ${durMs}ms -> \"$text\"${if (held) " (held)" else ""}")
         }
 
         override suspend fun finish(): String {
@@ -404,11 +430,30 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
             val audioMs = totalAudioSamples * 1000L / SAMPLE_RATE
             val rtf = if (audioMs > 0) totalDecodeMs.toDouble() / audioMs else 0.0
             Log.i(TAG, "ASR_TIMING: audioMs=$audioMs decodeMs=$totalDecodeMs rtf=${"%.3f".format(rtf)}")
-            val full = transcript.toString()
+
+            // Resolve held short segments. They ride along if the owner clearly spoke (>=1 long
+            // accepted) or the session had no long segments at all (deliberate single-word tap);
+            // they are dropped only when long segments were present and ALL were rejected.
+            val shortHeld = decoded.count { it.held }
+            val includeHeld = SessionGatePolicy.includeHeldShortSegments(longAccepted, longRejected)
+            if (shortHeld > 0 || longAccepted > 0 || longRejected > 0) {
+                Log.i(
+                    TAG,
+                    "SPEAKER_SESSION: longAccepted=$longAccepted longRejected=$longRejected " +
+                        "shortHeld=$shortHeld -> ${if (includeHeld) "included" else "dropped"}"
+                )
+            }
+            val full = decoded
+                .filter { !it.held || includeHeld }
+                .joinToString(" ") { it.text }
+            finalizedText = full
             Log.i(TAG, "ASR_FINAL: \"$full\"")
             return full
         }
     }
+
+    /** One decoded VAD segment in original order; [held] short segments are resolved at finish(). */
+    private data class Decoded(val order: Int, val text: String, val held: Boolean)
 
     companion object {
         private const val TAG = "Speak.Asr"

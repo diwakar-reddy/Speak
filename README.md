@@ -274,8 +274,13 @@ boolean) — computing cosine ourselves keeps the score loggable.
 
 Per VAD segment, before decode:
 
-- **Accepted** (`SPEAKER_ACCEPT: sim=<x.xxx> dur=<s.s>s`) → decoded as usual.
-- **Rejected** (`SPEAKER_REJECT: sim=<x.xxx> dur=<s.s>s`) → dropped, not decoded.
+- **Accepted** (`SPEAKER_ACCEPT: sim=<x.xxx> dur=<s.s>s`) — a long segment
+  (≥ `MIN_GATED_SEGMENT_SEC`) that matched the owner → decoded and appended as usual.
+- **Rejected** (`SPEAKER_REJECT: sim=<x.xxx> dur=<s.s>s`) — a long segment that did
+  **not** match → dropped, not decoded.
+- **Bypass-held** (`SPEAKER_BYPASS: sim=<x.xxx> dur=<s.s>s (held)`) — a short segment
+  (< `MIN_GATED_SEGMENT_SEC`) that is **not** gated standalone → decoded (decode is cheap)
+  but its text is *held*, to be included or dropped at session end (see below).
 
 **Fail-open** cases always accept (dictation is never blocked by the gate):
 
@@ -284,14 +289,46 @@ Per VAD segment, before decode:
   all segments accepted.
 - Embedding compute throws → `SPEAKER_ERROR` logged, segment accepted.
 
-### Threshold / short-segment policy
+### Threshold + short-segment (held) policy
 
-Accept when `cosine ≥ threshold`. The threshold defaults to sherpa-onnx's
-documented **0.60** and is persisted-configurable. Short segments carry less
-speaker information and score more noisily, so a segment **< 1.0 s** is judged
-against a slightly **relaxed** threshold (`0.60 − 0.05 = 0.55`) — the gate errs
-toward keeping the owner's own brief utterances. Both numbers are named constants
-(`SpeakerPolicy.DEFAULT_THRESHOLD`, `SHORT_SEGMENT_SEC`, `SHORT_SEGMENT_RELAXATION`).
+Long segments accept when `cosine ≥ threshold`. The threshold defaults to
+sherpa-onnx's documented **0.60** (`SpeakerPolicy.DEFAULT_THRESHOLD`) and is
+persisted-configurable.
+
+**Short segments are never gated by similarity.** CAM++ voiceprints on sub-~2 s
+speech carry too little speaker information to classify: on real hardware the
+owner's own single words ("much", "better", "good") scored `sim ≈ 0.28–0.32`,
+squarely inside the same 0.26–0.55 band strangers land in, while the same
+speaker's 3 s sentence scored `0.66`. No threshold can separate the owner's short
+words from a stranger's — so a per-segment relaxed threshold (the previous
+`0.60 − 0.05` rule) was useless and has been removed. Instead:
+
+- A segment **< `MIN_GATED_SEGMENT_SEC` (2.0 s)** is decoded unconditionally and
+  its text is **held** (logged `SPEAKER_BYPASS … (held)`), not appended yet.
+- A segment **≥ 2.0 s** is gated by similarity exactly as before
+  (`SPEAKER_ACCEPT` / `SPEAKER_REJECT`).
+
+At session finish, `SessionGatePolicy` decides the held short segments' fate from
+what the (reliably gated) long segments in the same session decided, and logs one
+summary line
+`SPEAKER_SESSION: longAccepted=<n> longRejected=<n> shortHeld=<n> -> included|dropped`:
+
+- **≥ 1 long segment accepted** as the owner → the owner was clearly present →
+  held shorts are **included**.
+- **No long segments at all** (e.g. a single-word "much" dictation — a deliberate
+  tap by the owner) → held shorts are **included**.
+- **Long segments present but ALL rejected** (sustained foreign speech) → held
+  shorts are **dropped** too.
+
+The final transcript preserves original segment order: accepted-long and included
+short segments are interleaved by their VAD-segment index. Held text only appears
+at finish; accepted-long text is visible immediately (`finalizedText`).
+
+**Honest trade-off:** a brief foreign interjection (a short word from someone else)
+during a session where the owner is otherwise accepted can ride along into the
+transcript — the cost of never dropping the owner's own short words. Sustained
+foreign speech (which produces rejected long segments and no accepted ones) is
+still fully blocked, held shorts included.
 
 ### Noise suppression
 
@@ -322,8 +359,12 @@ once); dictation still works, ungated.
 - `SPEAKER_MODEL_MISSING expected=<path>` — model absent; gate disabled (once).
 - `SPEAKER_ENROLLED utterances=<n> gate=on threshold=<t>` — enrollment succeeded.
 - `SPEAKER_CLEARED` — profile forgotten.
-- `SPEAKER_ACCEPT` / `SPEAKER_REJECT: sim=<x.xxx> dur=<s.s>s` — per-segment gate.
-- `SPEAKER_ERROR` — embedding compute failed → fail-open accept.
+- `SPEAKER_ACCEPT` / `SPEAKER_REJECT: sim=<x.xxx> dur=<s.s>s` — per-segment gate
+  (long segments ≥ 2.0 s).
+- `SPEAKER_BYPASS: sim=<x.xxx> dur=<s.s>s (held)` — short segment decoded but held.
+- `SPEAKER_SESSION: longAccepted=<n> longRejected=<n> shortHeld=<n> -> included|dropped`
+  — session-end resolution of the held short segments.
+- `SPEAKER_ERROR` — embedding compute failed on a long segment → fail-open accept.
 - `SPEAKER_STATUS enrolled=… utterances=… threshold=… gate=… modelFilePresent=…
   modelLoaded=… dim=…` — full state dump.
 - `NS_ATTACHED <true|false>` — noise suppressor attached for this capture session.
@@ -351,8 +392,14 @@ adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_SPEAKER_STATUS \
 
 `DEBUG_TRANSCRIBE_WAV` runs the full VAD → gate → ASR pipeline, so the speaker
 gate applies there too: while enrolled with speaker A, transcribing a different
-speaker's WAV drops every segment and yields an empty `ASR_FINAL`; toggling the
-gate off restores the full transcript.
+speaker's **sustained (long-segment) speech** drops every segment and yields an
+empty `ASR_FINAL`; toggling the gate off restores the full transcript. A
+**short-only** WAV (< 2.0 s of speech, no long segments) is bypass-held and, per
+`SessionGatePolicy`, included — so a single-word clip transcribes even when it is
+not the enrolled owner (short segments are unclassifiable, so they are kept).
+`DEBUG_VERIFY_WAV` reports the would-be per-segment outcome (`SPEAKER_ACCEPT` /
+`SPEAKER_REJECT` / `SPEAKER_BYPASS`) plus the `SPEAKER_SESSION` resolution, without
+decoding or enrolling — the clean read for threshold/duration calibration.
 
 ## Manual test flow
 

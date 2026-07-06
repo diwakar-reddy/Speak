@@ -274,9 +274,30 @@ class SpeakerVerifier private constructor(context: Context) {
         try {
             val segs = vad.segments(wave.samples)
             Log.i(TAG, "DEBUG_VERIFY_WAV: $path segments=${segs.size}")
+            // Mirror the live decode-path policy so calibration reads cleanly: per-segment we log
+            // the would-be outcome (gated ACCEPT/REJECT vs bypass-held), and at the end the same
+            // session-resolution SessionGatePolicy applies to the held short segments would take.
+            var longAccepted = 0
+            var longRejected = 0
+            var shortHeld = 0
             for (seg in segs) {
                 val durSec = seg.size / SAMPLE_RATE.toFloat()
-                logDecision(verify(seg, durSec), durSec)
+                val decision = verify(seg, durSec)
+                logDecision(decision, durSec)
+                when (decision.reason) {
+                    SpeakerReason.ACCEPT -> longAccepted++
+                    SpeakerReason.REJECT -> longRejected++
+                    SpeakerReason.BYPASS -> shortHeld++
+                    else -> Unit
+                }
+            }
+            if (shortHeld > 0 || longAccepted > 0 || longRejected > 0) {
+                val included = SessionGatePolicy.includeHeldShortSegments(longAccepted, longRejected)
+                Log.i(
+                    TAG,
+                    "SPEAKER_SESSION: longAccepted=$longAccepted longRejected=$longRejected " +
+                        "shortHeld=$shortHeld -> ${if (included) "included" else "dropped"}"
+                )
             }
         } finally {
             vad.release()
@@ -311,6 +332,7 @@ class SpeakerVerifier private constructor(context: Context) {
             when (decision.reason) {
                 SpeakerReason.ACCEPT -> Log.i(TAG, "SPEAKER_ACCEPT: sim=$sim dur=${dur}s")
                 SpeakerReason.REJECT -> Log.i(TAG, "SPEAKER_REJECT: sim=$sim dur=${dur}s")
+                SpeakerReason.BYPASS -> Log.i(TAG, "SPEAKER_BYPASS: sim=$sim dur=${dur}s (held)")
                 SpeakerReason.ERROR -> Log.w(TAG, "SPEAKER_ERROR: fail-open accept dur=${dur}s")
                 SpeakerReason.UNGATED -> Unit // no line: ungated decode is the normal path
             }

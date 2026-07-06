@@ -5,102 +5,114 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Pure-JVM tests for the speaker gate decision + threshold policy. */
+/** Pure-JVM tests for the speaker gate per-segment decision policy. */
 class SpeakerPolicyTest {
 
     private val base = SpeakerPolicy.DEFAULT_THRESHOLD // 0.60
+    private val minGated = SpeakerPolicy.MIN_GATED_SEGMENT_SEC // 2.0
 
-    // ---- threshold policy ----
+    private fun decide(
+        enrolled: Boolean = true,
+        gateEnabled: Boolean = true,
+        modelPresent: Boolean = true,
+        similarity: Float?,
+        durationSec: Float
+    ) = SpeakerPolicy.decide(enrolled, gateEnabled, modelPresent, similarity, durationSec, base)
 
-    @Test fun longSegmentUsesBaseThreshold() {
-        assertEquals(base, SpeakerPolicy.effectiveThreshold(base, 1.0f), 0f)
-        assertEquals(base, SpeakerPolicy.effectiveThreshold(base, 3.5f), 0f)
-    }
-
-    @Test fun shortSegmentRelaxesThreshold() {
-        assertEquals(
-            base - SpeakerPolicy.SHORT_SEGMENT_RELAXATION,
-            SpeakerPolicy.effectiveThreshold(base, 0.5f),
-            1e-6f
-        )
-    }
-
-    // ---- ungated (gate not in force) ----
+    // ---- ungated (gate not in force): always accept, never held, whatever the duration ----
 
     @Test fun notEnrolledIsUngatedAccept() {
-        val d = SpeakerPolicy.decide(
-            enrolled = false, gateEnabled = true, modelPresent = true,
-            similarity = 0.1f, durationSec = 2f, baseThreshold = base
-        )
+        val d = decide(enrolled = false, similarity = 0.1f, durationSec = 2f)
         assertTrue(d.accepted)
+        assertFalse(d.held)
         assertEquals(SpeakerReason.UNGATED, d.reason)
     }
 
     @Test fun gateOffIsUngatedAccept() {
-        val d = SpeakerPolicy.decide(
-            enrolled = true, gateEnabled = false, modelPresent = true,
-            similarity = 0.1f, durationSec = 2f, baseThreshold = base
-        )
+        val d = decide(gateEnabled = false, similarity = 0.1f, durationSec = 2f)
         assertTrue(d.accepted)
+        assertFalse(d.held)
         assertEquals(SpeakerReason.UNGATED, d.reason)
     }
 
     @Test fun modelMissingIsUngatedAccept() {
-        val d = SpeakerPolicy.decide(
-            enrolled = true, gateEnabled = true, modelPresent = false,
-            similarity = 0.1f, durationSec = 2f, baseThreshold = base
-        )
+        val d = decide(modelPresent = false, similarity = 0.1f, durationSec = 2f)
         assertTrue(d.accepted)
+        assertFalse(d.held)
         assertEquals(SpeakerReason.UNGATED, d.reason)
     }
 
-    // ---- fail-open ----
-
-    @Test fun nullSimilarityFailsOpenWithErrorReason() {
-        val d = SpeakerPolicy.decide(
-            enrolled = true, gateEnabled = true, modelPresent = true,
-            similarity = null, durationSec = 2f, baseThreshold = base
-        )
+    @Test fun shortSegmentUngatedStillAppendsNotHeld() {
+        // Even a very short segment appends normally when the gate is not in force.
+        val d = decide(enrolled = false, similarity = null, durationSec = 0.5f)
         assertTrue(d.accepted)
+        assertFalse(d.held)
+        assertEquals(SpeakerReason.UNGATED, d.reason)
+    }
+
+    // ---- fail-open on a gated (long) segment ----
+
+    @Test fun nullSimilarityOnLongSegmentFailsOpenWithErrorReason() {
+        val d = decide(similarity = null, durationSec = 2f)
+        assertTrue(d.accepted)
+        assertFalse(d.held)
         assertEquals(SpeakerReason.ERROR, d.reason)
     }
 
-    // ---- accept / reject ----
+    // ---- long segment: gated by similarity ----
 
-    @Test fun similarityAtOrAboveThresholdAccepts() {
-        val d = SpeakerPolicy.decide(
-            enrolled = true, gateEnabled = true, modelPresent = true,
-            similarity = 0.60f, durationSec = 2f, baseThreshold = base
-        )
+    @Test fun longSegmentSimilarityAtOrAboveThresholdAccepts() {
+        val d = decide(similarity = 0.60f, durationSec = 3f)
         assertTrue(d.accepted)
+        assertFalse(d.held)
         assertEquals(SpeakerReason.ACCEPT, d.reason)
         assertEquals(0.60f, d.similarity, 0f)
     }
 
-    @Test fun similarityBelowThresholdRejects() {
-        val d = SpeakerPolicy.decide(
-            enrolled = true, gateEnabled = true, modelPresent = true,
-            similarity = 0.45f, durationSec = 2f, baseThreshold = base
-        )
+    @Test fun longSegmentSimilarityBelowThresholdRejects() {
+        val d = decide(similarity = 0.45f, durationSec = 3f)
         assertFalse(d.accepted)
+        assertFalse(d.held)
         assertEquals(SpeakerReason.REJECT, d.reason)
     }
 
-    // ---- short-segment adjustment changes the outcome of a borderline segment ----
+    // ---- short segment: NEVER gated standalone -> decode + hold, regardless of similarity ----
 
-    @Test fun borderlineShortSegmentAcceptedButLongSegmentRejected() {
-        val sim = 0.57f // between relaxed 0.55 and base 0.60
-        val short = SpeakerPolicy.decide(
-            enrolled = true, gateEnabled = true, modelPresent = true,
-            similarity = sim, durationSec = 0.5f, baseThreshold = base
-        )
-        val long = SpeakerPolicy.decide(
-            enrolled = true, gateEnabled = true, modelPresent = true,
-            similarity = sim, durationSec = 2.0f, baseThreshold = base
-        )
-        assertTrue("short segment should be accepted under relaxed threshold", short.accepted)
-        assertEquals(SpeakerReason.ACCEPT, short.reason)
-        assertFalse("long segment should be rejected under base threshold", long.accepted)
-        assertEquals(SpeakerReason.REJECT, long.reason)
+    @Test fun shortSegmentIsBypassHeldEvenWhenSimilarityWouldReject() {
+        val d = decide(similarity = 0.30f, durationSec = 0.8f) // owner's real short words score ~0.3
+        assertTrue("short segment must still be decoded", d.accepted)
+        assertTrue("short segment text must be held", d.held)
+        assertEquals(SpeakerReason.BYPASS, d.reason)
+        assertEquals(0.30f, d.similarity, 0f)
+    }
+
+    @Test fun shortSegmentIsBypassHeldEvenWhenSimilarityWouldAccept() {
+        val d = decide(similarity = 0.90f, durationSec = 0.8f)
+        assertTrue(d.accepted)
+        assertTrue(d.held)
+        assertEquals(SpeakerReason.BYPASS, d.reason)
+    }
+
+    @Test fun shortSegmentWithNullSimilarityIsBypassHeldNotError() {
+        // A failed embedding on a short segment still bypasses/holds (short is never gated).
+        val d = decide(similarity = null, durationSec = 0.5f)
+        assertTrue(d.accepted)
+        assertTrue(d.held)
+        assertEquals(SpeakerReason.BYPASS, d.reason)
+    }
+
+    // ---- boundary at exactly MIN_GATED_SEGMENT_SEC (2.0 s) ----
+
+    @Test fun exactlyMinGatedSecondsIsGatedNotHeld() {
+        // 2.0 s is NOT < 2.0 s, so it is gated by similarity (here: below threshold -> REJECT).
+        val d = decide(similarity = 0.45f, durationSec = minGated)
+        assertFalse(d.held)
+        assertEquals(SpeakerReason.REJECT, d.reason)
+    }
+
+    @Test fun justBelowMinGatedSecondsIsHeld() {
+        val d = decide(similarity = 0.45f, durationSec = minGated - 0.01f)
+        assertTrue(d.held)
+        assertEquals(SpeakerReason.BYPASS, d.reason)
     }
 }
