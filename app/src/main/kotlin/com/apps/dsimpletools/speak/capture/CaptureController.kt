@@ -99,6 +99,9 @@ class CaptureController(
         }
     }
 
+    /** True while a dictation session is running (LISTENING or PROCESSING). */
+    fun isSessionActive(): Boolean = state != State.IDLE
+
     /** Hard-stop used when the accessibility service is being torn down mid-capture. */
     fun forceStopAndReset(reason: String) {
         Log.w(TAG, "CAPTURE: force stop ($reason), previous state=$state")
@@ -180,6 +183,8 @@ class CaptureController(
 
         state = State.LISTENING
         bubbleController.setBubbleState(BubbleState.LISTENING)
+        // A session is now active: the bubble must stay visible even if the IME hides.
+        service.onCaptureStateChanged()
     }
 
     private fun startAudioRecord(): Boolean {
@@ -291,13 +296,20 @@ class CaptureController(
 
             state = State.IDLE
             bubbleController.setBubbleState(BubbleState.IDLE)
+            // Session ended: re-evaluate visibility (the IME may have hidden meanwhile,
+            // in which case the bubble should now disappear).
+            service.onCaptureStateChanged()
         }
     }
 
     /**
      * Debug-only: run the full VAD -> ASR -> (punct) pipeline over a WAV file on disk
-     * (no mic, no FGS). Ensures the engine is loaded first. ASR_FINAL is logged by the
-     * engine. Invoked via the DEBUG_TRANSCRIBE_WAV broadcast.
+     * (no mic, no FGS), then run the transcript through the FormattingPipeline at the
+     * current persisted level. Makes the WAV hook a full text-quality probe
+     * (ASR -> format): both ASR_FINAL and FORMAT_RESULT are logged. It NEVER inserts
+     * text. Ensures the engine is loaded first. Invoked via the DEBUG_TRANSCRIBE_WAV
+     * broadcast. If a live session is active the engine rejects it (ASR_BUSY) and this
+     * returns an empty transcript without corrupting the live session.
      */
     fun debugTranscribeWav(path: String) {
         scope.launch {
@@ -310,9 +322,17 @@ class CaptureController(
                 }
             }
             Log.i(TAG, "CAPTURE: debug transcribe wav path=$path")
-            withContext(Dispatchers.Default) {
+            val transcript = withContext(Dispatchers.Default) {
                 runCatching { (asrEngine as SherpaAsrEngine).transcribeWav(path) }
                     .onFailure { Log.e(TAG, "CAPTURE: debug transcribe failed", it) }
+                    .getOrDefault("")
+                    .orEmpty()
+            }
+            // Full text-quality probe: feed the ASR transcript through the formatting
+            // pipeline (logs FORMAT_RESULT). Never inserts. Skipped when empty (ASR_BUSY
+            // rejection or no speech) since the pipeline no-ops on blank input.
+            if (transcript.isNotBlank()) {
+                FormatController.getInstance(service).format(transcript)
             }
         }
     }

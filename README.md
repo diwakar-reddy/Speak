@@ -105,12 +105,13 @@ If the required files are missing, `initialize()` fails gracefully: the app
 does **not** crash, a bubble tap shows a `Speak: ASR models not installed`
 toast, and `MODELS_MISSING expected=<path> missing=[...]` is logged.
 
-### Push commands (verified on emulator-5554, API 33)
+### Push commands — canonical recipe (mkdir → push → chmod)
 
 `adb push <dir>` into `Android/data/...` fails with
 `remote secure_mkdirs failed: Operation not permitted` because it tries to
 create nested subdirectories. Create the subdirectories first with
-`adb shell mkdir`, then push the **files** into the existing directories:
+`adb shell mkdir`, push the **files** into the existing directories, then
+**`chmod -R o+rX` the whole models tree** — this last step is mandatory:
 
 ```bash
 PKG=com.apps.dsimpletools.speak
@@ -118,9 +119,10 @@ DEST=/sdcard/Android/data/$PKG/files/models
 PK=sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8
 PU=sherpa-onnx-online-punct-en-2024-08-06
 
-# (install the app first so its data dir exists)
+# 1. Install the app first so its data dir exists, then create the subdirs.
 adb shell mkdir -p "$DEST/$PK/test_wavs" "$DEST/$PU"
 
+# 2. Push the files into the existing directories.
 adb push models/silero_vad.onnx                  "$DEST/silero_vad.onnx"
 adb push models/$PK/encoder.int8.onnx            "$DEST/$PK/encoder.int8.onnx"
 adb push models/$PK/decoder.int8.onnx            "$DEST/$PK/decoder.int8.onnx"
@@ -130,13 +132,28 @@ adb push models/$PK/test_wavs/0.wav              "$DEST/$PK/test_wavs/0.wav"  # 
 # Punctuation model is optional (disabled by default):
 adb push models/$PU/model.int8.onnx              "$DEST/$PU/model.int8.onnx"
 adb push models/$PU/bpe.vocab                    "$DEST/$PU/bpe.vocab"
+
+# 3. REQUIRED: make the whole tree world-readable/traversable.
+adb shell chmod -R o+rX "$DEST"
 ```
+
+**Why the `chmod` is required (do not skip it):** directories created by
+`adb shell mkdir` under `Android/data/<pkg>/files` are owned by the shell user
+and land in the `ext_data_rw` group with mode `2770` — i.e. **no world (other)
+access at all**. The app runs as its own distinct uid, which is neither the
+owner nor a member of `ext_data_rw`, so without world bits the app process
+cannot even traverse into the directories: `initialize()` reports
+`MODELS_MISSING` even though the files are visibly present on disk.
+`chmod -R o+rX` adds world read on files and world read+execute (traverse) on
+directories, which is exactly what the app uid needs. Re-run it any time you
+re-`mkdir`/re-push (adb-shell-created dirs always land group-only again).
 
 ### run-as fallback (if direct push to Android/data is denied)
 
-On stricter builds (e.g. Android 16 may refuse even the above), push into the
-always-writable `/data/local/tmp` and copy across as the app uid via `run-as`
-(the app owns its own `Android/data/<pkg>/files` tree):
+On stricter builds that refuse the direct push, stage into the always-writable
+`/data/local/tmp` and copy across as the app uid via `run-as` (the app owns its
+own `Android/data/<pkg>/files` tree, so files it creates are already readable by
+the app uid and need no `chmod`):
 
 ```bash
 adb push models/$PK/encoder.int8.onnx /data/local/tmp/encoder.int8.onnx
@@ -251,9 +268,13 @@ adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_TAP \
 ### Deterministic WAV test hook (debug builds only)
 
 Runs the full VAD → ASR → (punct) pipeline over a WAV file on disk — no
-microphone needed — and logs `ASR_FINAL`. Requires the accessibility service
-to be enabled (it owns the warm engine). Great for verifying the model
-pipeline in isolation:
+microphone needed — logs `ASR_FINAL`, then feeds that transcript through the
+`FormattingPipeline` at the current persisted level and logs `FORMAT_RESULT`.
+This makes the hook a full **text-quality probe (ASR → format)** with no mic.
+It never inserts text. Requires the accessibility service to be enabled (it
+owns the warm engine). If a live dictation session is active the engine rejects
+the request (`ASR_BUSY`) and the live session is left untouched — the hook can
+never steal or corrupt a running session:
 
 ```bash
 adb shell am broadcast -a com.apps.dsimpletools.speak.DEBUG_TRANSCRIBE_WAV \
@@ -286,10 +307,12 @@ position/size, which is what a test script should feed into
 
 ## Known limitations / next-step TODOs
 
-- `TextInserter`/`InsertMode.APPEND` appends at the end of the field's
-  existing text, not at the actual cursor position (no
-  `ACTION_ARGUMENT_SELECTION_START/END_INT` handling yet). Cursor-aware
-  insertion of the transcript is a later step.
+- Insertion is now **cursor-aware**: the transcript is spliced in at the field's
+  current caret position (via `textSelectionStart/End`), or *replaces* the
+  selected range when there is a selection, and the caret is then moved to just
+  after the inserted text (`ACTION_SET_SELECTION`). Separating spaces are added
+  only where needed (no stray space before clinging punctuation). If a field
+  exposes no usable selection (`-1`), it degrades to appending at the end.
 - Recognition is segment-based (VAD closes a segment → decode), so there is
   no live in-field partial preview while speaking — the full transcript
   appears on stop-tap. No streaming/partial UI yet.

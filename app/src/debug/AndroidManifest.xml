@@ -29,5 +29,12 @@
                 <action android:name="com.apps.dsimpletools.speak.DEBUG_FORMAT_TEXT" />
             </intent-filter>
         </receiver>
+        <receiver
+            android:name="com.apps.dsimpletools.speak.debug.DebugInsertReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.apps.dsimpletools.speak.DEBUG_INSERT_TEXT" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

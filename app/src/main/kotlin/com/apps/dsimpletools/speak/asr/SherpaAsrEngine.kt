@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 
 /**
@@ -56,6 +57,16 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
     private var recognizer: OfflineRecognizer? = null
     private var vad: Vad? = null
     private var punctuation: OnlinePunctuation? = null
+
+    // Single-flight session ownership. The recogniser/VAD are stateful native objects
+    // shared by every session; allowing two sessions (e.g. a live dictation and the
+    // DEBUG_TRANSCRIBE_WAV hook) to touch them concurrently corrupts the VAD circular
+    // buffer -> "Invalid n" -> a decode with a {0,128} shape -> a native FATAL that
+    // killed the whole process. Exactly one session may own the engine at a time; any
+    // second acquire is rejected (ASR_BUSY) and becomes an inert no-op that never
+    // touches native state. Uses object identity so a rejected session can never
+    // release the owner's lock.
+    private val sessionOwner = AtomicReference<SherpaAsrSession?>(null)
 
     /** Absolute path of the models root we expect on disk (used for logging + toasts). */
     val modelsDir: File
@@ -156,7 +167,13 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
 
     override fun startSession(): AsrSession {
         check(isReady) { "startSession() called before engine is ready" }
-        return SherpaAsrSession()
+        val session = SherpaAsrSession(owner = "live")
+        if (!session.acquired) {
+            // A debug/other session is already running. Return the inert session so the
+            // caller degrades to an empty transcript rather than corrupting native state.
+            Log.w(TAG, "ASR_BUSY: startSession rejected, another session is already active")
+        }
+        return session
     }
 
     override fun release() {
@@ -184,15 +201,23 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
      */
     suspend fun transcribeWav(path: String): String {
         check(isReady) { "transcribeWav() called before engine is ready" }
+        // Acquire single-flight ownership BEFORE touching any native state. If a live
+        // dictation session is running, reject the debug hook outright: it must never
+        // steal or corrupt the live session's VAD/decoder.
+        val session = SherpaAsrSession(owner = "debug-wav")
+        if (!session.acquired) {
+            Log.w(TAG, "ASR_BUSY: DEBUG_TRANSCRIBE_WAV rejected, a live session is active")
+            return ""
+        }
         val wave = runCatching { WaveReader.readWave(filename = path) }.getOrNull()
-            ?: run {
-                Log.e(TAG, "ASR: could not read WAV at $path")
-                return ""
-            }
+        if (wave == null) {
+            Log.e(TAG, "ASR: could not read WAV at $path")
+            // finish() closes the (empty) channel so the worker exits and releases ownership.
+            return session.finish()
+        }
         if (wave.sampleRate != SAMPLE_RATE) {
             Log.w(TAG, "ASR: WAV sampleRate=${wave.sampleRate} (expected $SAMPLE_RATE); feeding as-is")
         }
-        val session = SherpaAsrSession()
         val samples = wave.samples
         var i = 0
         while (i < samples.size) {
@@ -209,7 +234,13 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
      * them, converts to float, windows them through the VAD, and decodes each closed
      * speech segment.
      */
-    private inner class SherpaAsrSession : AsrSession {
+    private inner class SherpaAsrSession(private val owner: String) : AsrSession {
+
+        // Single-flight guard: claim engine ownership up front, using object identity so
+        // a rejected session can never accidentally release the real owner's lock. An
+        // unacquired session is fully inert (acceptAudio/finish no-op) and never launches
+        // a worker, so it can never touch the shared native VAD/recogniser.
+        val acquired: Boolean = sessionOwner.compareAndSet(null, this)
 
         private val audioChannel = Channel<FloatArray>(capacity = Channel.UNLIMITED)
         private val transcript = StringBuilder()
@@ -224,17 +255,49 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
         private var totalAudioSamples = 0L
         private var totalDecodeMs = 0L
 
-        private val worker: Job = engineScope.launch {
-            val localVad = vad ?: return@launch
-            localVad.reset()
-            for (chunk in audioChannel) {
-                processSamples(localVad, chunk)
+        private val worker: Job? = if (acquired) engineScope.launch { runWorker() } else null
+
+        private suspend fun runWorker() {
+            try {
+                val localVad = vad ?: run {
+                    Log.w(TAG, "ASR_ERROR: worker started with null VAD (owner=$owner)")
+                    return
+                }
+                // Reset the VAD at session start so a crashed/abandoned prior session
+                // can't poison this one with stale circular-buffer state.
+                localVad.reset()
+                for (chunk in audioChannel) {
+                    processSamples(localVad, chunk)
+                }
+                // Channel closed by finish(): flush any open segment + the sub-window tail.
+                flushTail(localVad)
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                // Engine release()/teardown cancels the worker; propagate so structured
+                // concurrency stays correct (the finally still releases ownership).
+                throw c
+            } catch (t: Throwable) {
+                // A native/decode failure fails THIS session gracefully. It must never
+                // propagate off the decode thread and kill the whole process (the old
+                // concurrency crash). The transcript accumulated so far is still returned.
+                Log.e(
+                    TAG,
+                    "ASR_ERROR: decode worker failed (owner=$owner) " +
+                        "${t.javaClass.simpleName}: ${t.message}",
+                    t
+                )
+            } finally {
+                releaseOwnership()
             }
-            // Channel closed by finish(): flush any open segment + the sub-window tail.
-            flushTail(localVad)
+        }
+
+        private fun releaseOwnership() {
+            if (sessionOwner.compareAndSet(this, null)) {
+                Log.d(TAG, "ASR: session ownership released (owner=$owner)")
+            }
         }
 
         override fun acceptAudio(frame: ShortArray, length: Int) {
+            if (!acquired) return
             val floats = FloatArray(length)
             for (i in 0 until length) floats[i] = frame[i] / 32768f
             // trySend never blocks on an UNLIMITED channel; safe from the capture thread.
@@ -243,6 +306,7 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
 
         /** Feed float samples directly (WAV debug path). */
         fun acceptFloat(samples: FloatArray) {
+            if (!acquired) return
             audioChannel.trySend(samples)
         }
 
@@ -287,10 +351,16 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
             val durMs = samples.size * 1000L / SAMPLE_RATE
             val t0 = SystemClock.elapsedRealtime()
             val stream = rec.createStream()
-            stream.acceptWaveform(samples, SAMPLE_RATE)
-            rec.decode(stream)
-            var text = rec.getResult(stream).text.trim()
-            stream.release()
+            // Wrap the native decode so the stream is always released even if decode
+            // throws; the throw then propagates to runWorker() which fails the session
+            // gracefully instead of crashing the process.
+            var text = try {
+                stream.acceptWaveform(samples, SAMPLE_RATE)
+                rec.decode(stream)
+                rec.getResult(stream).text.trim()
+            } finally {
+                runCatching { stream.release() }
+            }
             if (ENABLE_PUNCTUATION && text.isNotEmpty()) {
                 punctuation?.let { text = it.addPunctuation(text).trim() }
             }
@@ -304,8 +374,9 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
         }
 
         override suspend fun finish(): String {
+            if (!acquired) return ""
             audioChannel.close()
-            worker.join()
+            worker?.join()
             val audioMs = totalAudioSamples * 1000L / SAMPLE_RATE
             val rtf = if (audioMs > 0) totalDecodeMs.toDouble() / audioMs else 0.0
             Log.i(TAG, "ASR_TIMING: audioMs=$audioMs decodeMs=$totalDecodeMs rtf=${"%.3f".format(rtf)}")

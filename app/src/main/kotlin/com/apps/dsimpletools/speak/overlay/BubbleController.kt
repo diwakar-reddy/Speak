@@ -64,6 +64,22 @@ class BubbleController(private val service: AccessibilityService) {
         }
     }
 
+    /**
+     * Make the existing bubble visible again without moving it (used mid-dictation
+     * when the field bounds are no longer available but the session must keep the
+     * bubble on screen). No-op if the bubble was never created.
+     */
+    fun ensureVisible() {
+        val existing = bubbleView ?: return
+        if (existing.visibility != View.VISIBLE) {
+            existing.visibility = View.VISIBLE
+            Log.i(TAG, "BUBBLE: ensureVisible (kept at last position)")
+        }
+    }
+
+    /** Whether the overlay bubble currently exists (created, not necessarily visible). */
+    fun hasBubble(): Boolean = bubbleView != null
+
     fun setBubbleState(state: BubbleState) {
         bubbleView?.setState(state)
     }
