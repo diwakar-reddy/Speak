@@ -66,7 +66,8 @@ data class StatusUiState(
     val speakerModelPresent: Boolean = false,
     val speakerEnrolled: Boolean = false,
     val speakerUtterances: Int = 0,
-    val speakerGateEnabled: Boolean = false
+    val speakerGateEnabled: Boolean = false,
+    val speakerHasBackup: Boolean = false
 )
 
 enum class EnrollPhase { IDLE, RECORDING, PROCESSING }
@@ -113,6 +114,7 @@ class MainActivity : ComponentActivity() {
 
     private var uiState by mutableStateOf(StatusUiState())
     private var enrollState by mutableStateOf(EnrollmentUiState())
+    private var showClearConfirm by mutableStateOf(false)
 
     private val formatController by lazy { FormatController.getInstance(this) }
     private val speakerVerifier by lazy { SpeakerVerifier.getInstance(this) }
@@ -146,8 +148,15 @@ class MainActivity : ComponentActivity() {
                         onToggleGate = { enabled -> onToggleGate(enabled) },
                         onEnroll = { startEnrollment() },
                         onAddSample = { startAddSample() },
-                        onClearEnrollment = { clearEnrollment() }
+                        onClearEnrollment = { showClearConfirm = true },
+                        onRestoreEnrollment = { restoreEnrollment() }
                     )
+                    if (showClearConfirm) {
+                        ClearConfirmDialog(
+                            onConfirm = { performClear() },
+                            onDismiss = { showClearConfirm = false }
+                        )
+                    }
                     if (enrollState.active) {
                         val adding = enrollState.mode == EnrollMode.ADD_SAMPLE
                         EnrollmentDialog(
@@ -318,9 +327,21 @@ class MainActivity : ComponentActivity() {
         uiState = uiState.copy(speakerGateEnabled = enabled)
     }
 
-    private fun clearEnrollment() {
+    /** Called after the user confirms the "delete your voice profile" dialog. */
+    private fun performClear() {
+        showClearConfirm = false
         speakerVerifier.clear()
         toast("Voice enrollment cleared")
+        refreshState()
+    }
+
+    /**
+     * Reload the profile from the rolling backup left by the last Clear/re-enroll/append
+     * (offered only while not enrolled — see [refreshState]'s `speakerHasBackup`).
+     */
+    private fun restoreEnrollment() {
+        val ok = speakerVerifier.restoreFromBackup()
+        toast(if (ok) "Voice profile restored" else "No backup to restore")
         refreshState()
     }
 
@@ -358,7 +379,8 @@ class MainActivity : ComponentActivity() {
             speakerModelPresent = speakerVerifier.isModelFilePresent,
             speakerEnrolled = speakerVerifier.isEnrolled,
             speakerUtterances = speakerVerifier.utteranceCount,
-            speakerGateEnabled = speakerVerifier.gateEnabled
+            speakerGateEnabled = speakerVerifier.gateEnabled,
+            speakerHasBackup = speakerVerifier.hasBackup
         )
         // Nano feature availability is an async on-device check; update when it resolves.
         lifecycleScope.launch {
@@ -386,7 +408,8 @@ private fun MainScreen(
     onToggleGate: (Boolean) -> Unit,
     onEnroll: () -> Unit,
     onAddSample: () -> Unit,
-    onClearEnrollment: () -> Unit
+    onClearEnrollment: () -> Unit,
+    onRestoreEnrollment: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -422,7 +445,8 @@ private fun MainScreen(
             onToggleGate = onToggleGate,
             onEnroll = onEnroll,
             onAddSample = onAddSample,
-            onClearEnrollment = onClearEnrollment
+            onClearEnrollment = onClearEnrollment,
+            onRestoreEnrollment = onRestoreEnrollment
         )
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -465,7 +489,8 @@ private fun VoiceSection(
     onToggleGate: (Boolean) -> Unit,
     onEnroll: () -> Unit,
     onAddSample: () -> Unit,
-    onClearEnrollment: () -> Unit
+    onClearEnrollment: () -> Unit,
+    onRestoreEnrollment: () -> Unit
 ) {
     Text(text = "Voice", style = MaterialTheme.typography.titleMedium)
     Spacer(modifier = Modifier.height(8.dp))
@@ -534,7 +559,42 @@ private fun VoiceSection(
                 "(keeps the last 10; oldest are replaced).",
             style = MaterialTheme.typography.bodySmall
         )
+    } else if (state.speakerHasBackup) {
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onRestoreEnrollment,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Restore previous profile")
+        }
+        Text(
+            text = "A backup from before your last Clear or re-enroll is available.",
+            style = MaterialTheme.typography.bodySmall
+        )
     }
+}
+
+@Composable
+private fun ClearConfirmDialog(
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Clear voice profile?") },
+        text = {
+            Text(
+                "Deletes your voice profile — dictation keeps working but without voice " +
+                    "isolation until you re-enroll."
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Clear") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 @Composable

@@ -3,6 +3,7 @@ package com.apps.dsimpletools.speak.speaker
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -113,5 +114,129 @@ class SpeakerProfileStoreTest {
         val result = s.append(listOf(emb(4), emb(5)), maxCount = 3)
         assertEquals(3, result.size)
         for (i in result.indices) assertEquals((i + 3).toFloat(), result[i][0], 0f) // 3,4,5
+    }
+
+    // ---- backup: created before any replace/delete, single rolling file, restore round-trip ----
+
+    private fun backupFile() = File(tmp.root, SpeakerProfileStore.BACKUP_FILE_NAME)
+
+    @Test fun firstSaveOnEmptyStoreCreatesNoBackup() {
+        val s = store()
+        assertFalse(s.hasBackup())
+        s.save(listOf(emb(1)))
+        // Nothing existed to replace, so there is nothing to back up yet.
+        assertFalse(s.hasBackup())
+        assertFalse(backupFile().exists())
+    }
+
+    @Test fun savingOverAnExistingProfileBacksUpTheOldOneNotTheNewOne() {
+        val s = store()
+        s.save(listOf(emb(1), emb(2))) // original enrollment
+        s.save(listOf(emb(9))) // re-enroll: backs up the original, then replaces it
+        assertTrue(s.hasBackup())
+
+        // Current file is the NEW profile.
+        val current = store().load()
+        assertEquals(1, current.size)
+        assertEquals(9f, current[0][0], 0f)
+
+        // The backup holds the OLD profile, not the new one (restore is the only public way
+        // to inspect backup contents; round-trip coverage lives in the restore tests below).
+        assertTrue(s.restoreFromBackup())
+        val afterRestore = store().load()
+        assertEquals(2, afterRestore.size)
+        assertEquals(1f, afterRestore[0][0], 0f)
+        assertEquals(2f, afterRestore[1][0], 0f)
+    }
+
+    @Test fun clearBacksUpBeforeDeleting() {
+        val s = store()
+        s.save(listOf(emb(1), emb(2), emb(3)))
+        assertFalse(s.hasBackup())
+        s.clear()
+        assertFalse(s.exists())
+        assertTrue(s.hasBackup())
+    }
+
+    @Test fun restoreFromBackupRoundTripsAfterClear() {
+        val s = store()
+        val original = listOf(emb(1), emb(2), emb(3))
+        s.save(original)
+        s.clear()
+        assertFalse(s.exists())
+        assertTrue(s.hasBackup())
+
+        val restored = s.restoreFromBackup()
+        assertTrue(restored)
+        assertTrue(s.exists())
+        val loaded = store().load() // fresh instance: round-trips through disk
+        assertEquals(original.size, loaded.size)
+        for (i in original.indices) assertArrayEquals(original[i], loaded[i], 0f)
+    }
+
+    @Test fun restoreFromBackupRoundTripsAfterReplace() {
+        val s = store()
+        val original = listOf(emb(1), emb(2))
+        s.save(original)
+        s.save(listOf(emb(9))) // re-enroll: backs up `original`, then replaces it
+
+        val restored = s.restoreFromBackup()
+        assertTrue(restored)
+        val loaded = store().load()
+        assertEquals(original.size, loaded.size)
+        for (i in original.indices) assertArrayEquals(original[i], loaded[i], 0f)
+    }
+
+    @Test fun restoreFromBackupIsARollingSingleFileNotAHistory() {
+        val s = store()
+        s.save(listOf(emb(1))) // no backup yet
+        s.save(listOf(emb(2))) // backs up [1]
+        s.save(listOf(emb(3))) // backs up [2] — overwrites the [1] backup, not a history
+
+        s.restoreFromBackup()
+        val loaded = store().load()
+        assertEquals(1, loaded.size)
+        assertEquals(2f, loaded[0][0], 0f) // the most recent backup, not the original
+    }
+
+    @Test fun restoreFromBackupFailsGracefullyWhenNoBackupExists() {
+        val s = store()
+        assertFalse(s.hasBackup())
+        assertFalse(s.restoreFromBackup())
+        assertFalse(s.exists()) // no-op: nothing was created
+    }
+
+    @Test fun restoreFromBackupFailsGracefullyOnACorruptBackupFile() {
+        val s = store()
+        s.save(listOf(emb(1))) // creates a current profile (no backup yet)
+        backupFile().parentFile?.mkdirs()
+        backupFile().writeBytes(byteArrayOf(1, 2, 3)) // corrupt/foreign .bak, too short to parse
+        assertTrue(s.hasBackup())
+
+        assertFalse(s.restoreFromBackup())
+        // The good current profile must be untouched by a failed restore attempt.
+        val loaded = store().load()
+        assertEquals(1, loaded.size)
+        assertEquals(1f, loaded[0][0], 0f)
+    }
+
+    // ---- tmp-file hygiene: a write failure must not corrupt the existing profile or leak a tmp file ----
+
+    @Test fun tmpFileIsCleanedUpAndProfileUntouchedOnSimulatedWriteFailure() {
+        val s = store()
+        s.save(listOf(emb(1), emb(2))) // existing, good profile
+
+        // Sabotage the write: pre-create the tmp path as a directory so FileOutputStream(tmp)
+        // throws inside writeProfile(), simulating a mid-write disk failure.
+        val tmpPath = File(tmp.root, "${SpeakerProfileStore.FILE_NAME}.tmp")
+        tmpPath.mkdir()
+
+        assertThrows(Exception::class.java) { s.save(listOf(emb(3))) }
+
+        assertFalse("failed write must not leak the tmp file/dir", tmpPath.exists())
+        val loaded = store().load()
+        assertEquals("existing profile must survive a failed replace untouched", 2, loaded.size)
+        assertEquals(1f, loaded[0][0], 0f)
+        assertEquals(2f, loaded[1][0], 0f)
     }
 }

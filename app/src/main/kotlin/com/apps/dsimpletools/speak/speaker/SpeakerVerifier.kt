@@ -70,6 +70,9 @@ class SpeakerVerifier private constructor(context: Context) {
     val isModelFilePresent: Boolean get() = speakerModelFile.exists()
     val isModelLoaded: Boolean get() = modelPresent
 
+    /** Whether a rolling backup exists (a prior Clear/re-enroll/append replaced a profile). */
+    val hasBackup: Boolean get() = store.hasBackup()
+
     var threshold: Float
         get() = prefs.getFloat(KEY_THRESHOLD, SpeakerPolicy.DEFAULT_THRESHOLD)
         set(value) {
@@ -186,6 +189,19 @@ class SpeakerVerifier private constructor(context: Context) {
      * Enroll (replace) the owner from a list of already-computed embeddings. Persists the
      * raw embeddings, rebuilds the mean profile, and turns the gate on. Returns true on
      * success (a non-empty, dimensionally-valid profile was built).
+     *
+     * Sequencing (this is the whole safety story for re-enrollment): every embedding is
+     * captured and validated by the caller *before* this is ever invoked (see
+     * [com.apps.dsimpletools.speak.MainActivity] — a live `MutableList` accumulates them
+     * across the guided prompts and is never touched here). The current in-memory profile
+     * ([rawEmbeddings]/[profileMean]/[gateEnabled]) and the on-disk file are therefore left
+     * completely alone — still active, still gating — right up until the single [store.save]
+     * call below either fully succeeds (one atomic tmp-file-then-rename write, see
+     * [SpeakerProfileStore]) or fully fails. On failure the persisted file is guaranteed
+     * untouched (the store never renames a partial write over it) and this method also
+     * leaves the in-memory fields untouched and returns false, so a disk-write failure during
+     * the final persist degrades to "enrollment failed, try again" rather than silently
+     * wiping a working profile.
      */
     @Synchronized
     fun enrollFromEmbeddings(embeddings: List<FloatArray>): Boolean {
@@ -198,7 +214,14 @@ class SpeakerVerifier private constructor(context: Context) {
             Log.w(TAG, "SPEAKER_ENROLL_FAILED could not build profile mean")
             return false
         }
-        store.save(embeddings)
+        val persisted = runCatching { store.save(embeddings) }
+            .onFailure { Log.e(TAG, "SPEAKER_ENROLL_FAILED persist ${it.javaClass.simpleName}: ${it.message}") }
+            .isSuccess
+        if (!persisted) {
+            // The store never touches the real file until the write fully succeeds, so the
+            // previous profile (if any) is still on disk and still loaded in memory here.
+            return false
+        }
         rawEmbeddings = embeddings
         profileMean = mean
         gateEnabled = true // default ON after a successful enrollment
@@ -254,13 +277,50 @@ class SpeakerVerifier private constructor(context: Context) {
         return true
     }
 
-    /** Forget the owner profile. Leaves the gate flag as-is (it is inert while not enrolled). */
+    /**
+     * Forget the owner profile. [SpeakerProfileStore.clear] backs the current file up to
+     * `speaker_profile.bak` before deleting it, so [restoreFromBackup] can undo this (e.g. an
+     * accidental tap). Leaves the gate flag as-is (it is inert while not enrolled).
+     */
     @Synchronized
     fun clear() {
         store.clear()
         rawEmbeddings = emptyList()
         profileMean = null
-        Log.i(TAG, "SPEAKER_CLEARED")
+        Log.i(TAG, "SPEAKER_CLEARED backup=${store.hasBackup()}")
+    }
+
+    /**
+     * Restore the owner profile from the rolling backup left by the last profile-replacing or
+     * -deleting operation (re-enroll, append, or Clear) — the undo path for e.g. an accidental
+     * Clear. Only runs while NOT currently enrolled (a defensive guard: this is a recovery
+     * action for the empty state, not a way to blow away a working profile with a stale
+     * backup) and only commits if the backup parses as a valid, non-empty profile. Re-activates
+     * the gate on success, mirroring a fresh enrollment. Returns false (no-op) otherwise.
+     */
+    @Synchronized
+    fun restoreFromBackup(): Boolean {
+        if (isEnrolled) {
+            Log.w(TAG, "SPEAKER_RESTORE_SKIPPED already enrolled")
+            return false
+        }
+        if (!store.restoreFromBackup()) {
+            Log.w(TAG, "SPEAKER_RESTORE_FAILED no valid backup")
+            return false
+        }
+        val restored = store.load()
+        val mean = SpeakerMath.meanEmbedding(restored)
+        if (mean == null || restored.isEmpty()) {
+            // Shouldn't happen — the store validates the backup before committing it — but
+            // stay fail-safe rather than leave a half-adopted profile.
+            Log.w(TAG, "SPEAKER_RESTORE_FAILED restored file did not yield a valid profile")
+            return false
+        }
+        rawEmbeddings = restored
+        profileMean = mean
+        gateEnabled = true // re-activate the gate, same default as a fresh enrollment
+        Log.i(TAG, "SPEAKER_RESTORED utterances=${restored.size} gate=on")
+        return true
     }
 
     // ---- Debug WAV helpers (routed via DEBUG_* broadcasts) ----
@@ -373,7 +433,7 @@ class SpeakerVerifier private constructor(context: Context) {
             TAG,
             "SPEAKER_STATUS enrolled=$isEnrolled utterances=$utteranceCount " +
                 "threshold=$threshold gate=$gateEnabled modelFilePresent=$isModelFilePresent " +
-                "modelLoaded=$modelPresent dim=$embeddingDim"
+                "modelLoaded=$modelPresent dim=$embeddingDim backup=$hasBackup"
         )
     }
 

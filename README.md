@@ -259,9 +259,16 @@ In the app's **Voice** section: *Enroll* (or *Re-enroll*) opens a guided dialog
 with 3 read-aloud sentences (~8–12 s each). Each utterance is recorded with the
 same capture config as dictation (`VOICE_RECOGNITION`, 16 kHz mono) + noise
 suppression, silence-trimmed with the Silero VAD, and requires **≥ 4 s of net
-speech** or it re-prompts. The 3 embeddings become the owner profile, persisted,
-and the **"Only my voice"** gate is switched on (it is only effective once
-enrolled; default ON after a successful enrollment). *Clear* forgets the profile.
+speech** or it re-prompts. All 3 utterances are captured and embedded **before**
+anything is persisted or the existing profile is touched — the previous profile
+stays on disk and stays the active gate right up until the single replacing
+write succeeds (see [Profile safety](#profile-safety-atomic-writes-backup-and-clear-confirmation)
+below), so cancelling the dialog, backing out, a killed app process, or a
+too-short/failed utterance mid-flow leaves whatever was enrolled before
+completely untouched and still gating. Once persisted, the **"Only my voice"**
+gate is switched on (it is only effective once enrolled; default ON after a
+successful enrollment). *Clear* forgets the profile (behind a confirmation
+dialog — see below).
 
 **Add voice sample** (shown only when already enrolled) records ONE additional
 guided utterance — same flow, same ≥ 4 s net-speech retry — and **appends** it to
@@ -282,6 +289,41 @@ from them on every start. The format (SPK1 v1) is unchanged by append-enrollment
 identically. sherpa-onnx's `SpeakerEmbeddingManager` is deliberately **not** used
 for persistence (its store is in-memory native and returns only a boolean) —
 computing cosine ourselves keeps the score loggable.
+
+### Profile safety: atomic writes, backup, and Clear confirmation
+
+The voice profile is the one piece of app state that is expensive to
+reconstruct (it requires you, in person, reading prompts aloud), so
+`SpeakerProfileStore` is written defensively:
+
+- **Atomic writes.** Every persist (`save`, which both re-enrollment and
+  append-enrollment funnel through) writes to `speaker_profile.bin.tmp`,
+  best-effort `fsync`s it, then renames it over `speaker_profile.bin`. The real
+  file is only ever replaced by one completed, durable write — a crash or
+  killed process mid-write leaves the previous profile exactly as it was, and
+  any tmp-file remnant from a failed write is deleted rather than left behind.
+- **Rolling backup before anything destructive.** Immediately before `save`
+  replaces an existing profile, or before *Clear* deletes one, the current
+  `speaker_profile.bin` is copied to `speaker_profile.bak` (a single rolling
+  backup — each destructive operation overwrites it, it is not a history).
+  Append-enrollment ("Add voice sample") goes through the same `save`, so it
+  also leaves a pre-append backup.
+- **Clear requires confirmation.** Tapping *Clear* shows a confirmation dialog
+  ("Deletes your voice profile — dictation keeps working but without voice
+  isolation until you re-enroll.") before anything is touched; only on
+  confirm does it back up then delete.
+- **Restore.** When the app is **not enrolled** and a `speaker_profile.bak`
+  exists (e.g. right after a Clear, or after any re-enrollment), the Voice
+  section shows a **"Restore previous profile"** button that reloads the
+  backup — parsed and validated before it is committed, so a corrupt or
+  unrelated `.bak` can never clobber a working profile — re-activates the
+  gate, and shows a toast on success.
+- **Caveat for existing installs:** the `.bak` file does not exist
+  retroactively — it is only ever written by a `save`/`clear` call *on a build
+  that includes this safety net*. If your profile was already lost before
+  upgrading to a build with this change, there is nothing to restore from;
+  the very next Clear or re-enrollment on the new build is what starts
+  protecting you going forward.
 
 ### Scoring (composite)
 
@@ -400,7 +442,17 @@ once); dictation still works, ungated.
 - `SPEAKER_ENROLLED utterances=<n> gate=on threshold=<t>` — enrollment succeeded.
 - `SPEAKER_APPENDED added=<k> utterances=<n> cap=10 threshold=<t>` — extra
   sample(s) appended to the profile (oldest rotated out beyond the cap).
-- `SPEAKER_CLEARED` — profile forgotten.
+- `SPEAKER_CLEARED backup=<true|false>` — profile forgotten; `backup` reports
+  whether a `speaker_profile.bak` now exists (i.e. whether there was a profile
+  to back up before deleting).
+- `SPEAKER_RESTORED utterances=<n> gate=on` — "Restore previous profile"
+  succeeded; the backup was validated and adopted, gate re-activated.
+- `SPEAKER_RESTORE_FAILED …` — restore was attempted but there was no backup,
+  or it failed to parse as a valid profile; the not-enrolled state is
+  unchanged.
+- `SPEAKER_RESTORE_SKIPPED already enrolled` — restore was called while a
+  profile is already active; refused defensively (restore is only exposed in
+  the UI when not enrolled).
 - `SPEAKER_SCORE: mean=<x.xxx> bestUtt=<x.xxx> used=<x.xxx>` — (debug level) the
   composite-score decomposition for a gated segment; `used` is what the decision
   lines report as `sim=`.
@@ -411,7 +463,8 @@ once); dictation still works, ungated.
   — session-end resolution of the held short segments.
 - `SPEAKER_ERROR` — embedding compute failed on a long segment → fail-open accept.
 - `SPEAKER_STATUS enrolled=… utterances=… threshold=… gate=… modelFilePresent=…
-  modelLoaded=… dim=…` — full state dump.
+  modelLoaded=… dim=… backup=…` — full state dump, including whether a
+  rolling backup is available to restore.
 - `NS_ATTACHED <true|false>` — noise suppressor attached for this capture session.
 
 ### Debug broadcasts (debug builds only)
