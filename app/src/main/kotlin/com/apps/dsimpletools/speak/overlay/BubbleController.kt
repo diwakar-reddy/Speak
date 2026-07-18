@@ -1,6 +1,7 @@
 package com.apps.dsimpletools.speak.overlay
 
 import android.accessibilityservice.AccessibilityService
+import android.animation.ValueAnimator
 import android.graphics.PixelFormat
 import android.graphics.Point
 import android.os.Build
@@ -35,11 +36,30 @@ class BubbleController(private val service: AccessibilityService) {
     private var downParamX = 0
     private var downParamY = 0
     private var isDragging = false
+    private var snapAnimator: ValueAnimator? = null
 
     /** Set by the service once it has a [com.apps.dsimpletools.speak.capture.CaptureController] to call. */
     var onTap: (() -> Unit)? = null
 
+    /**
+     * Invoked (with the snapped edge and the released y, in absolute screen px) once the user
+     * finishes a committed drag (ACTION_UP). The service uses it to persist the preferred edge
+     * and remember the released y for the rest of the current focus session. Not fired for a
+     * cancelled drag, so an aborted gesture never persists anything.
+     */
+    var onDragReleased: ((edge: BubblePositioner.Edge, y: Int) -> Unit)? = null
+
+    /**
+     * Supplies the latest IME top edge in absolute screen px (or null when the keyboard is
+     * hidden / its bounds are unavailable). Backed by a value the service caches on each
+     * (window-driven) re-evaluation, so reading it during touch dispatch costs no Binder IPC
+     * and still reflects a keyboard that appears mid-drag.
+     */
+    var imeTopProvider: () -> Int? = { null }
+
     fun show(x: Int, y: Int) {
+        // An in-flight snap must not keep driving updateViewLayout over an explicit placement.
+        snapAnimator?.cancel()
         val existing = bubbleView
         if (existing == null) {
             createBubble(x, y)
@@ -57,6 +77,8 @@ class BubbleController(private val service: AccessibilityService) {
     }
 
     fun hide() {
+        // Stop any snap so it can't keep calling updateViewLayout on a hidden view.
+        snapAnimator?.cancel()
         val existing = bubbleView ?: return
         if (existing.visibility != View.GONE) {
             existing.visibility = View.GONE
@@ -98,6 +120,8 @@ class BubbleController(private val service: AccessibilityService) {
 
     /** Synchronously tears down the overlay window. Call from service teardown paths only. */
     fun destroy() {
+        snapAnimator?.cancel()
+        snapAnimator = null
         val existing = bubbleView ?: return
         runCatching { windowManager.removeViewImmediate(existing) }
         bubbleView = null
@@ -149,6 +173,7 @@ class BubbleController(private val service: AccessibilityService) {
         val currentParams = params ?: return false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                snapAnimator?.cancel()
                 downRawX = event.rawX
                 downRawY = event.rawY
                 downParamX = currentParams.x
@@ -165,18 +190,28 @@ class BubbleController(private val service: AccessibilityService) {
                 }
                 if (isDragging) {
                     val screen = screenSize()
-                    currentParams.x = (downParamX + dx.roundToInt())
-                        .coerceIn(0, (screen.x - bubbleSizePx).coerceAtLeast(0))
-                    currentParams.y = (downParamY + dy.roundToInt())
-                        .coerceIn(0, (screen.y - bubbleSizePx).coerceAtLeast(0))
+                    // imeTopProvider() reads the service's cached IME top (no IPC here) so a
+                    // keyboard that appears mid-drag is honoured on the next move.
+                    val clamped = BubblePositioner.clamp(
+                        x = downParamX + dx.roundToInt(),
+                        y = downParamY + dy.roundToInt(),
+                        screenWidth = screen.x,
+                        screenHeight = screen.y,
+                        bubbleSizePx = bubbleSizePx,
+                        imeTop = imeTopProvider()
+                    )
+                    currentParams.x = clamped.x
+                    currentParams.y = clamped.y
                     runCatching { windowManager.updateViewLayout(view, currentParams) }
                     logPosition()
                 }
                 return true
             }
 
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (!isDragging) {
+            MotionEvent.ACTION_UP -> {
+                if (isDragging) {
+                    snapToEdge(view, currentParams, commit = true)
+                } else {
                     view.performClick()
                     Log.i(TAG, "BUBBLE: tap detected")
                     onTap?.invoke()
@@ -184,8 +219,44 @@ class BubbleController(private val service: AccessibilityService) {
                 isDragging = false
                 return true
             }
+
+            MotionEvent.ACTION_CANCEL -> {
+                // Aborted gesture: settle the view to an edge but persist nothing.
+                if (isDragging) snapToEdge(view, currentParams, commit = false)
+                isDragging = false
+                return true
+            }
         }
         return false
+    }
+
+    /**
+     * Snap the bubble horizontally to the nearest screen edge (briefly animated). When [commit]
+     * (a real ACTION_UP release), also report the edge + released y via [onDragReleased] so the
+     * service persists the preference and pins the session y; a cancelled drag ([commit] false)
+     * settles visually but reports nothing. The reported values are known up front, so we report
+     * immediately and let the animation be purely cosmetic.
+     */
+    private fun snapToEdge(view: View, p: WindowManager.LayoutParams, commit: Boolean) {
+        val screen = screenSize()
+        val edge = BubblePositioner.nearestEdge(p.x, screen.x, bubbleSizePx)
+        val targetX = BubblePositioner.edgeX(edge, screen.x, bubbleSizePx)
+        if (commit) {
+            Log.i(TAG, "BUBBLE: snapped edge=${edge.name}")
+            onDragReleased?.invoke(edge, p.y)
+        }
+
+        snapAnimator?.cancel()
+        if (p.x == targetX) return
+        snapAnimator = ValueAnimator.ofInt(p.x, targetX).apply {
+            duration = SNAP_MS
+            addUpdateListener {
+                p.x = it.animatedValue as Int
+                runCatching { windowManager.updateViewLayout(view, p) }
+                logPosition()
+            }
+            start()
+        }
     }
 
     private fun logPosition() {
@@ -196,5 +267,6 @@ class BubbleController(private val service: AccessibilityService) {
 
     companion object {
         private const val TAG = "Speak.Bubble"
+        private const val SNAP_MS = 150L
     }
 }

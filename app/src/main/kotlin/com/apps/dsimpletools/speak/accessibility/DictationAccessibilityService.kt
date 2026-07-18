@@ -41,6 +41,25 @@ class DictationAccessibilityService : AccessibilityService() {
     private var pendingRunnable: Runnable? = null
     private var serviceScope: CoroutineScope? = null
 
+    private val prefs by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
+
+    /**
+     * Y (absolute screen px) the user last released the bubble at via a drag. Held for the
+     * rest of the current focus session so debounced re-evaluations don't stomp it; cleared
+     * on a genuinely new field focus so rule-1 rest placement is recomputed. [sessionScreenW]/
+     * [sessionScreenH] record the screen size it was captured at so a rotation invalidates it.
+     */
+    private var sessionY: Int? = null
+    private var sessionScreenW = 0
+    private var sessionScreenH = 0
+
+    /**
+     * Latest IME top edge (absolute screen px, or null when no keyboard / bounds unavailable),
+     * refreshed on every re-evaluation and read by [BubbleController] during a drag so touch
+     * dispatch never does a Binder window query.
+     */
+    private var cachedImeTop: Int? = null
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         if (isSetUp) {
@@ -52,6 +71,8 @@ class DictationAccessibilityService : AccessibilityService() {
         val inserter = AccessibilityTextInserter { currentTarget }
         val capture = CaptureController(this, bubble, inserter)
         bubble.onTap = { capture.onBubbleTapped() }
+        bubble.onDragReleased = { edge, y -> onBubbleDragReleased(edge, y) }
+        bubble.imeTopProvider = { cachedImeTop }
 
         bubbleController = bubble
         captureController = capture
@@ -75,7 +96,7 @@ class DictationAccessibilityService : AccessibilityService() {
                 // then re-evaluate (debounced) so IME visibility is factored in.
                 val node = event.source
                 if (node != null && node.isEditable && !node.isPassword) {
-                    currentTarget = node
+                    setCurrentTarget(node)
                 }
                 scheduleReevaluate("focus")
             }
@@ -84,7 +105,7 @@ class DictationAccessibilityService : AccessibilityService() {
                 // via a click; route it through the same candidate + re-evaluate path.
                 val node = event.source
                 if (node != null && node.isEditable && !node.isPassword) {
-                    currentTarget = node
+                    setCurrentTarget(node)
                     scheduleReevaluate("click")
                 }
             }
@@ -119,24 +140,30 @@ class DictationAccessibilityService : AccessibilityService() {
         val controller = bubbleController ?: return
         val sessionActive = captureController?.isSessionActive() == true
 
+        // Single accessibility-window query per pass: derives both IME visibility (for the
+        // policy) and the IME top edge (for placement + the drag clamp cache), and is reused
+        // by the focus rescan below.
+        val wins = runCatching { windows }.getOrNull()
+        val ime = imeInfo(wins)
+        cachedImeTop = ime.top
+
         // Resolve a focused, editable, non-password target: prefer the event-driven one
-        // if it is still valid, else rescan the active window.
+        // if it is still valid, else rescan the windows list.
         var target = currentTarget
         val currentValid = target != null && target.refresh() &&
             target.isFocused && target.isEditable && !target.isPassword
         if (!currentValid) {
-            target = findFocusedEditable()
-            currentTarget = target
+            setCurrentTarget(findFocusedEditable(wins))
+            target = currentTarget
         }
         val editableFocused = target != null
-        val imeVisible = isImeVisible()
 
         val shouldShow =
-            BubbleVisibilityPolicy.shouldShow(editableFocused, imeVisible, sessionActive)
+            BubbleVisibilityPolicy.shouldShow(editableFocused, ime.visible, sessionActive)
         Log.i(
             TAG,
             "BUBBLE: reevaluate ($reason) editableFocused=$editableFocused " +
-                "imeVisible=$imeVisible session=$sessionActive -> ${if (shouldShow) "show" else "hide"}"
+                "imeVisible=${ime.visible} session=$sessionActive -> ${if (shouldShow) "show" else "hide"}"
         )
 
         if (!shouldShow) {
@@ -149,19 +176,39 @@ class DictationAccessibilityService : AccessibilityService() {
             // Reposition from the current field bounds (handles relayout / IME re-show).
             val fieldBounds = Rect()
             node.getBoundsInScreen(fieldBounds)
-            val position = BubblePositioner.computePosition(
-                fieldBoundsInScreen = fieldBounds,
-                screenSize = controller.screenSize(),
+            val screen = controller.screenSize()
+            val edge = preferredEdge()
+            val position = BubblePositioner.resolve(
+                heldY = sessionY,
+                heldScreenWidth = sessionScreenW,
+                heldScreenHeight = sessionScreenH,
+                fieldTop = fieldBounds.top,
+                fieldBottom = fieldBounds.bottom,
+                screenWidth = screen.x,
+                screenHeight = screen.y,
                 bubbleSizePx = controller.bubbleSizePx,
-                marginPx = MARGIN_PX
+                edge = edge,
+                density = resources.displayMetrics.density,
+                imeTop = ime.top
             )
-            Log.i(TAG, "BUBBLE: show fieldBounds=$fieldBounds pos=(${position.x},${position.y})")
+            Log.i(TAG, "BUBBLE: show fieldBounds=$fieldBounds edge=$edge pos=(${position.x},${position.y})")
             controller.show(position.x, position.y)
         } else {
             // Session active but no field bounds (field lost focus mid-session): keep the
             // bubble where it is rather than hiding it out from under the user.
             controller.ensureVisible()
         }
+    }
+
+    /**
+     * Sets the currently targeted node, forgetting any dragged session y when the target
+     * genuinely changes (by source-node identity) — so a new field reached via focus, click,
+     * or the rescan path all start from a freshly computed rest position rather than inheriting
+     * the previous field's y. Re-finding the same field keeps the dragged y.
+     */
+    private fun setCurrentTarget(node: AccessibilityNodeInfo?) {
+        if (node != currentTarget) sessionY = null
+        currentTarget = node
     }
 
     /**
@@ -173,15 +220,14 @@ class DictationAccessibilityService : AccessibilityService() {
      * `findFocus`/`rootInActiveWindow` miss the app's focused field. We therefore also
      * scan every non-IME window's tree for the input focus.
      */
-    private fun findFocusedEditable(): AccessibilityNodeInfo? {
+    private fun findFocusedEditable(wins: List<AccessibilityWindowInfo>?): AccessibilityNodeInfo? {
         fun eligible(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? =
             if (n != null && n.isEditable && !n.isPassword) n else null
 
         eligible(findFocus(AccessibilityNodeInfo.FOCUS_INPUT))?.let { return it }
         eligible(rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT))?.let { return it }
 
-        val wins = runCatching { windows }.getOrNull() ?: return null
-        for (window in wins) {
+        for (window in wins ?: return null) {
             if (window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
             val root = runCatching { window.root }.getOrNull() ?: continue
             eligible(root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT))?.let { return it }
@@ -189,10 +235,42 @@ class DictationAccessibilityService : AccessibilityService() {
         return null
     }
 
-    /** Whether a soft-keyboard (IME) window is currently on screen. */
-    private fun isImeVisible(): Boolean {
-        val wins = runCatching { windows }.getOrNull() ?: return false
-        return wins.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+    /** Visibility + top edge of the IME, derived from one already-fetched window list. */
+    private data class ImeInfo(val visible: Boolean, val top: Int?)
+
+    /**
+     * Whether the soft keyboard is on screen and, if so, its top edge in absolute screen px.
+     * The top is null only when there's no IME window OR the window reports an empty rect
+     * (bounds unavailable — placement then falls back to a plain full-screen clamp). A present
+     * IME whose top is <= 0 (mid-animation / fullscreen extract mode) still constrains, rather
+     * than silently disabling the above-keyboard clamp.
+     */
+    private fun imeInfo(wins: List<AccessibilityWindowInfo>?): ImeInfo {
+        val ime = wins?.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+            ?: return ImeInfo(visible = false, top = null)
+        val bounds = Rect()
+        ime.getBoundsInScreen(bounds)
+        return ImeInfo(visible = true, top = if (bounds.isEmpty) null else bounds.top)
+    }
+
+    /** Persisted preferred resting edge; RIGHT until the user drags the bubble to an edge. */
+    private fun preferredEdge(): BubblePositioner.Edge =
+        prefs.getString(KEY_EDGE, null)
+            ?.let { runCatching { BubblePositioner.Edge.valueOf(it) }.getOrNull() }
+            ?: BubblePositioner.Edge.RIGHT
+
+    /**
+     * Called by [BubbleController] once a committed drag settles on an edge: persist that edge
+     * as the new preference and hold the released y (with the screen size it was captured at,
+     * so a later rotation discards it) for the rest of this focus session.
+     */
+    private fun onBubbleDragReleased(edge: BubblePositioner.Edge, y: Int) {
+        val screen = bubbleController?.screenSize() ?: return
+        prefs.edit().putString(KEY_EDGE, edge.name).apply()
+        sessionY = y
+        sessionScreenW = screen.x
+        sessionScreenH = screen.y
+        Log.i(TAG, "BUBBLE: drag released, edge=$edge persisted, sessionY=$y")
     }
 
     private fun cancelPendingReevaluate() {
@@ -261,6 +339,8 @@ class DictationAccessibilityService : AccessibilityService() {
         serviceScope?.cancel()
         serviceScope = null
         currentTarget = null
+        sessionY = null
+        cachedImeTop = null
         bubbleController = null
         captureController = null
         textInserter = null
@@ -271,7 +351,9 @@ class DictationAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "Speak.Accessibility"
         private const val FOCUS_DEBOUNCE_MS = 200L
-        private const val MARGIN_PX = 24
+
+        private const val PREFS = "speak_bubble"
+        private const val KEY_EDGE = "preferred_edge"
 
         @Volatile
         private var instance: DictationAccessibilityService? = null

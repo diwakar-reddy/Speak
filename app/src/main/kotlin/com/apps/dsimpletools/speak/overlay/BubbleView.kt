@@ -46,6 +46,8 @@ class BubbleView(context: Context) : FrameLayout(context) {
             BubbleState.PROCESSING -> ContextCompat.getColor(context, R.color.bubble_processing)
         }
         circleBackground.setColor(color)
+        // Dimmed when idle so it's unobtrusive at rest; fully opaque during a live session.
+        alpha = if (state == BubbleState.IDLE) IDLE_ALPHA else 1f
         if (state == BubbleState.LISTENING) startPulse() else stopPulse()
     }
 
@@ -74,5 +76,6 @@ class BubbleView(context: Context) : FrameLayout(context) {
 
     companion object {
         const val SIZE_DP = 48
+        private const val IDLE_ALPHA = 0.55f
     }
 }
