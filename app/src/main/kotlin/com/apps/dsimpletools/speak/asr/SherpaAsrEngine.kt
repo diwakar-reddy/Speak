@@ -272,6 +272,14 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
 
         // Rolling remainder of samples that didn't fill a full VAD window yet.
         private var carry = FloatArray(0)
+
+        // Raw session audio retained for the whole-session VAD fallback (see VadFallbackPolicy):
+        // if Silero produces ZERO segments (whispered/quiet speech it misses), the buffered audio
+        // is decoded wholesale in runWorker. Chunk REFERENCES only — never copied — so buffering
+        // adds no per-chunk allocation churn; capped at fallbackCap samples.
+        private val fallbackBuffer = ArrayList<FloatArray>()
+        private var fallbackSamples = 0
+        private val fallbackCap = VadFallbackPolicy.maxBufferedSamples(SAMPLE_RATE)
         private var segmentIndex = 0
         private var totalAudioSamples = 0L
         private var totalDecodeMs = 0L
@@ -296,6 +304,10 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
                 }
                 // Channel closed by finish(): flush any open segment + the sub-window tail.
                 flushTail(localVad)
+                // Whole-session VAD fallback. Runs here — still on the decode thread — so the
+                // engine's "all native decode on this thread" invariant holds, and only AFTER
+                // flushTail so every normal VAD segment has been drained/decoded first.
+                maybeRunVadFallback()
             } catch (c: kotlinx.coroutines.CancellationException) {
                 // Engine release()/teardown cancels the worker; propagate so structured
                 // concurrency stays correct (the finally still releases ownership).
@@ -337,6 +349,13 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
 
         private fun processSamples(localVad: Vad, incoming: FloatArray) {
             totalAudioSamples += incoming.size
+            // Retain a reference to this chunk for the VAD fallback until the cap; past it we stop
+            // (fallback is for short tap-bounded sessions). `incoming` is never mutated after being
+            // queued, so keeping the reference is safe and copy-free.
+            if (fallbackSamples < fallbackCap) {
+                fallbackBuffer.add(incoming)
+                fallbackSamples += incoming.size
+            }
             val buf = if (carry.isEmpty()) {
                 incoming
             } else {
@@ -368,6 +387,35 @@ class SherpaAsrEngine(context: Context) : AsrEngine {
             while (!localVad.empty()) {
                 decodeSegment(localVad.front().samples)
                 localVad.pop()
+            }
+        }
+
+        /**
+         * Whole-session VAD fallback. When the VAD produced nothing usable this session (no segment
+         * decoded and none speaker-gate-rejected — see [VadFallbackPolicy]), decode the buffered
+         * raw audio wholesale through [decodeSegment] so the speaker gate, held-segment logic, and
+         * ASR_SEGMENT logging all apply unchanged. Frees the buffer either way. Worker-thread only.
+         */
+        private fun maybeRunVadFallback() {
+            val trigger = VadFallbackPolicy.shouldDecodeWholeSession(
+                decodedSegments = decoded.size,
+                rejectedSegments = longRejected,
+                bufferedSamples = fallbackSamples,
+                sampleRate = SAMPLE_RATE
+            )
+            if (trigger) {
+                val whole = FloatArray(fallbackSamples)
+                var pos = 0
+                for (chunk in fallbackBuffer) {
+                    System.arraycopy(chunk, 0, whole, pos, chunk.size)
+                    pos += chunk.size
+                }
+                val durMs = whole.size * 1000L / SAMPLE_RATE
+                Log.i(TAG, "ASR_VAD_FALLBACK: decoding whole session ${durMs}ms (0 VAD segments)")
+                fallbackBuffer.clear() // free the buffered chunks before the (large) decode
+                decodeSegment(whole)
+            } else {
+                fallbackBuffer.clear()
             }
         }
 
